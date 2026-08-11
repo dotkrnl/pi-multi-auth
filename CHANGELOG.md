@@ -11,7 +11,7 @@ All notable changes to this project will be documented in this file.
 - Regression tests for same-millisecond usage-cache dedup and the status summary formatters.
 
 ### Changed
-- `anthropic`, `github-copilot`, and `kimi-coding` now default to `usage-based` rotation (previously round-robin), matching their working quota endpoints.
+- `anthropic`, `github-copilot`, and `kimi-coding` now default to `usage-based` rotation (previously round-robin), matching their working quota endpoints. **Upgrade note:** if you ran an older version before, `config.json` `rotationModes` may contain auto-migrated per-provider overrides (e.g. `"kimi-coding": "round-robin"`) that take precedence over the new defaults — clear those entries to adopt them.
 
 ### Fixed
 - Usage cache dedup (`pruneEntries`/`pruneDisplayEntries`) now lets the later write win an exact `fetchedAt` tie. Previously two fetches within the same millisecond kept the stale entry, which made `usage-persistent-cache` ambiguity tests flaky (~17% failure rate) and could show a stale display snapshot after a rapid refetch.
