@@ -84,7 +84,37 @@ function formatCompactPercent(summary: ProviderUsageSummary): string | null {
 }
 
 /**
- * Compact single-line footer text, e.g. "kimi-coding×2:35%/27%w codex:7%".
+ * Short statusline aliases for known provider IDs, keeping the compact footer
+ * readable (e.g. `openai-codex` renders as `gpt`). Unknown providers fall back
+ * to their full provider ID.
+ */
+const PROVIDER_STATUSLINE_ALIASES: Readonly<Record<string, string>> = {
+	anthropic: "claude",
+	blazeapi: "blaze",
+	"command-code": "cmdcode",
+	"github-copilot": "copilot",
+	google: "gemini",
+	"google-vertex": "vertex",
+	"kimi-coding": "kimi",
+	"minimax-cn": "minimax",
+	"moonshotai-cn": "moonshot",
+	openai: "gpt",
+	"openai-codex": "gpt",
+	"qwen-token-plan-cn": "qwen",
+	"xiaomi-token-plan-cn": "xiaomi",
+	zai: "zai",
+	"zai-coding-cn": "glm",
+};
+
+/**
+ * Resolves the compact statusline alias for a provider ID.
+ */
+export function formatProviderStatuslineAlias(provider: string): string {
+	return PROVIDER_STATUSLINE_ALIASES[provider] ?? provider;
+}
+
+/**
+ * Compact single-line footer text, e.g. "kimi×2|35%/27%w  gpt|7%".
  * Returns undefined when no provider has usage data worth showing.
  */
 export function formatQuotaStatusLine(
@@ -98,7 +128,7 @@ export function formatQuotaStatusLine(
 		}
 		const accountBadge = summary.accountCount > 1 ? `×${summary.accountCount}` : "";
 		const exhaustedMarker = summary.activeQuotaExhausted ? "!" : "";
-		segments.push(`${summary.provider}${accountBadge}:${percent}${exhaustedMarker}`);
+		segments.push(`${formatProviderStatuslineAlias(summary.provider)}${accountBadge}|${percent}${exhaustedMarker}`);
 	}
 	return segments.length > 0 ? segments.join("  ") : undefined;
 }

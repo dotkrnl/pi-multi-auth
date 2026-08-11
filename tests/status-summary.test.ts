@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+	formatProviderStatuslineAlias,
 	formatQuotaStatusLine,
 	formatStatusReport,
 	summarizeProviderStatuses,
@@ -91,7 +92,57 @@ test("formatQuotaStatusLine compacts providers and marks quota exhaustion", () =
 		}),
 	];
 	const line = formatQuotaStatusLine(summarizeProviderStatuses(statuses, now));
-	assert.equal(line, "kimi-coding×2:100%!");
+	assert.equal(line, "kimi×2|100%!");
+});
+
+test("formatQuotaStatusLine renders short provider aliases", () => {
+	const now = Date.now();
+	const snapshot = {
+		timestamp: 1,
+		provider: "openai-codex",
+		planType: null,
+		primary: { usedPercent: 14, windowMinutes: 300, resetsAt: null },
+		secondary: null,
+		credits: null,
+		copilotQuota: null,
+		updatedAt: 1,
+	};
+	const statuses = [
+		providerStatus({
+			provider: "openai-codex",
+			credentials: [credential({ credentialId: "openai-codex", isActive: true, usageSnapshot: snapshot })],
+		}),
+		providerStatus({
+			provider: "zai-coding-cn",
+			credentials: [
+				credential({
+					credentialId: "zai-coding-cn",
+					isActive: true,
+					usageSnapshot: { ...snapshot, provider: "zai-coding-cn" },
+				}),
+			],
+		}),
+		providerStatus({
+			provider: "custom-provider",
+			credentials: [
+				credential({
+					credentialId: "custom-provider",
+					isActive: true,
+					usageSnapshot: { ...snapshot, provider: "custom-provider" },
+				}),
+			],
+		}),
+	];
+	const line = formatQuotaStatusLine(summarizeProviderStatuses(statuses, now));
+	assert.equal(line, "gpt|14%  glm|14%  custom-provider|14%");
+});
+
+test("formatProviderStatuslineAlias maps known providers and falls back to the id", () => {
+	assert.equal(formatProviderStatuslineAlias("openai-codex"), "gpt");
+	assert.equal(formatProviderStatuslineAlias("anthropic"), "claude");
+	assert.equal(formatProviderStatuslineAlias("kimi-coding"), "kimi");
+	assert.equal(formatProviderStatuslineAlias("zai-coding-cn"), "glm");
+	assert.equal(formatProviderStatuslineAlias("unknown-provider"), "unknown-provider");
 });
 
 test("formatQuotaStatusLine returns undefined without usage data", () => {
