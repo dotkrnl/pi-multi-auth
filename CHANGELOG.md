@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.11.0 - 2026-08-11
+
+### Changed
+- Ported to Pi 0.84.x: pi-ai 0.80+ removed the global OAuth provider registry, so `oauth-compat` now keeps a local registry for extension-registered providers and adapts built-in provider factories (`provider.auth.oauth`, AuthInteraction login API) to the extension's legacy OAuth surface on demand.
+- Switched `getModels`/`getProviders`/`getApiProvider`/`registerApiProvider` imports to the `@earendil-works/pi-ai/compat` entry point.
+- Handle nullable `ProviderHeaders` values (header deletion semantics) when stripping credential-managed auth headers.
+- Peer dependencies now require Pi 0.84.x (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`).
+
 ## 0.10.0 - 2026-06-01
 
 ### Added

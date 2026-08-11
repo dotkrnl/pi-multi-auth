@@ -1,5 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
-import { getModels, getProviders, type Api, type Model } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { getModels, getProviders } from "@earendil-works/pi-ai/compat";
 import { getOAuthProvider, getOAuthProviders } from "./oauth-compat.js";
 import { registerClineOAuthProvider } from "./oauth-cline.js";
 import { registerKiloOAuthProvider } from "./oauth-kilo.js";

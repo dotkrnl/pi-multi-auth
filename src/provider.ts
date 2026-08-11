@@ -5,11 +5,13 @@ import {
 	type AssistantMessageEventStream,
 	type Context,
 	createAssistantMessageEventStream,
-	getApiProvider,
 	type Model,
-	registerApiProvider,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
+import {
+	getApiProvider,
+	registerApiProvider,
+} from "@earendil-works/pi-ai/compat";
 import type {
 	ExtensionAPI,
 	ProviderModelConfig,
@@ -466,11 +468,14 @@ function stripCallerAuthHeaders(
 		return headers;
 	}
 
-	const sanitizedHeaders: Record<string, string> = {};
+	const sanitizedHeaders: Record<string, string | null> = {};
 	const strippedHeaderNames: string[] = [];
 	for (const [headerName, headerValue] of Object.entries(headers)) {
 		const normalizedHeaderName = headerName.trim().toLowerCase();
-		if (CREDENTIAL_MANAGED_AUTH_HEADER_NAMES.has(normalizedHeaderName)) {
+		if (
+			typeof headerValue === "string" &&
+			CREDENTIAL_MANAGED_AUTH_HEADER_NAMES.has(normalizedHeaderName)
+		) {
 			strippedHeaderNames.push(headerName);
 			continue;
 		}

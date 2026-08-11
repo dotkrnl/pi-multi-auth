@@ -1,15 +1,18 @@
+import type {
+	Api,
+	AuthEvent,
+	AuthPrompt,
+	Model,
+	OAuthCredential,
+	Provider,
+	ProviderAuthInteraction,
+} from "@earendil-works/pi-ai";
 import {
-	getOAuthProvider as getOAuthProviderFromPiAi,
-	getOAuthProviders as getOAuthProvidersFromPiAi,
-	registerOAuthProvider as registerOAuthProviderFromPiAi,
-	resetOAuthProviders as resetOAuthProvidersFromPiAi,
-	unregisterOAuthProvider as unregisterOAuthProviderFromPiAi,
 	type OAuthCredentials,
 	type OAuthDeviceCodeInfo,
 	type OAuthLoginCallbacks,
-	type OAuthProviderId,
-	type OAuthProviderInterface,
 } from "@earendil-works/pi-ai/oauth";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import {
 	formatOAuthRefreshFailureSummary,
 	isRecord,
@@ -262,38 +265,192 @@ async function refreshOpenAICodexCredential(
 	};
 }
 
+export type OAuthProviderId = string;
+
 /**
- * Runtime-compatible OAuth helpers re-exported from the ESM-only pi-ai OAuth entry.
+ * Legacy OAuth provider surface used throughout this extension.
  *
- * The extension previously used createRequire()/require() to load the helper, but
- * pi-ai publishes the oauth module through import-only package exports. Direct ESM
- * imports work across current Pi builds and avoid ERR_PACKAGE_PATH_NOT_EXPORTED.
+ * pi-ai >= 0.80 removed the global OAuth provider registry; OAuth now lives
+ * behind provider factories (`provider.auth.oauth`) with an AuthInteraction
+ * login API. This module keeps the extension's legacy shape and bridges it
+ * to the provider-factory world: built-in providers are adapted on demand,
+ * while providers registered by this extension (kimi-coding, qwen, cline,
+ * kilo, test doubles) live in a local registry that shadows the built-ins.
  */
+export interface OAuthProviderInterface {
+	readonly id: OAuthProviderId;
+	readonly name: string;
+	/** Run the login flow, return credentials to persist */
+	login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
+	/** Whether login uses a local callback server and supports manual code input. */
+	usesCallbackServer?: boolean;
+	/** Refresh expired credentials, return updated credentials to persist */
+	refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials>;
+	/** Convert credentials to API key string for the provider */
+	getApiKey(credentials: OAuthCredentials): string;
+	/** Optional: modify models for this provider (e.g., update baseUrl) */
+	modifyModels?(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[];
+}
+
+const extensionOAuthProviders = new Map<OAuthProviderId, OAuthProviderInterface>();
+const builtinOAuthAdapters = new Map<OAuthProviderId, OAuthProviderInterface>();
+let builtinOAuthProvidersCache: ReadonlyMap<OAuthProviderId, Provider> | null = null;
+
+function getBuiltinOAuthProviders(): ReadonlyMap<OAuthProviderId, Provider> {
+	if (!builtinOAuthProvidersCache) {
+		const providers = new Map<OAuthProviderId, Provider>();
+		for (const provider of builtinProviders()) {
+			if (provider.auth.oauth) {
+				providers.set(provider.id, provider);
+			}
+		}
+		builtinOAuthProvidersCache = providers;
+	}
+	return builtinOAuthProvidersCache;
+}
+
+function stripCredentialType(credential: OAuthCredential): OAuthCredentials {
+	const { type: _type, ...credentials } = credential;
+	return credentials;
+}
+
+const OAUTH_LOGIN_CANCELLED_MESSAGE = "OAuth login cancelled.";
+
+/**
+ * Translate legacy login callbacks into the provider-factory AuthInteraction
+ * API. Built-in provider login flows call `prompt()`/`notify()`; this routes
+ * those calls back to the extension's callback surface.
+ */
+function adaptLoginCallbacks(callbacks: OAuthLoginCallbacks): ProviderAuthInteraction {
+	return {
+		signal: callbacks.signal ?? new AbortController().signal,
+		prompt: async (prompt: AuthPrompt): Promise<string> => {
+			switch (prompt.type) {
+				case "select": {
+					const selected = await callbacks.onSelect({
+						message: prompt.message,
+						options: prompt.options.map((option) => ({
+							id: option.id,
+							label: option.label,
+						})),
+					});
+					if (selected === undefined) {
+						throw new Error(OAUTH_LOGIN_CANCELLED_MESSAGE);
+					}
+					return selected;
+				}
+				case "manual_code": {
+					if (callbacks.onManualCodeInput) {
+						return callbacks.onManualCodeInput();
+					}
+					return callbacks.onPrompt({
+						message: prompt.message,
+						placeholder: prompt.placeholder,
+					});
+				}
+				default:
+					return callbacks.onPrompt({
+						message: prompt.message,
+						placeholder: prompt.placeholder,
+					});
+			}
+		},
+		notify: (event: AuthEvent): void => {
+			switch (event.type) {
+				case "auth_url":
+					callbacks.onAuth({ url: event.url, instructions: event.instructions });
+					break;
+				case "device_code":
+					callbacks.onDeviceCode({
+						userCode: event.userCode,
+						verificationUri: event.verificationUri,
+						intervalSeconds: event.intervalSeconds,
+						expiresInSeconds: event.expiresInSeconds,
+					});
+					break;
+				case "info":
+				case "progress":
+					callbacks.onProgress?.(event.message);
+					break;
+			}
+		},
+	};
+}
+
+function adaptBuiltinOAuthProvider(provider: Provider): OAuthProviderInterface {
+	const oauth = provider.auth.oauth;
+	if (!oauth) {
+		throw new Error(`Provider has no OAuth auth: ${provider.id}`);
+	}
+	return {
+		id: provider.id,
+		name: oauth.name || provider.name,
+		usesCallbackServer: false,
+		login: async (callbacks) =>
+			stripCredentialType(await oauth.login(adaptLoginCallbacks(callbacks))),
+		refreshToken: async (credentials) =>
+			stripCredentialType(
+				await oauth.refresh(
+					{ type: "oauth", ...credentials },
+					new AbortController().signal,
+				),
+			),
+		getApiKey: (credentials) => credentials.access,
+	};
+}
+
+function getBuiltinOAuthAdapter(id: OAuthProviderId): OAuthProviderInterface | undefined {
+	const cached = builtinOAuthAdapters.get(id);
+	if (cached) {
+		return cached;
+	}
+	const provider = getBuiltinOAuthProviders().get(id);
+	if (!provider) {
+		return undefined;
+	}
+	const adapter = adaptBuiltinOAuthProvider(provider);
+	builtinOAuthAdapters.set(id, adapter);
+	return adapter;
+}
+
 export function getOAuthProvider(
 	id: OAuthProviderId,
 ): OAuthProviderInterface | undefined {
 	if (isRemovedLegacyGoogleProvider(id)) {
 		return undefined;
 	}
-	return getOAuthProviderFromPiAi(id);
+	return extensionOAuthProviders.get(id) ?? getBuiltinOAuthAdapter(id);
 }
 
 export function getOAuthProviders(): OAuthProviderInterface[] {
-	return getOAuthProvidersFromPiAi().filter(
-		(provider) => !isRemovedLegacyGoogleProvider(provider.id),
-	);
+	const providers = new Map<OAuthProviderId, OAuthProviderInterface>();
+	for (const id of getBuiltinOAuthProviders().keys()) {
+		if (isRemovedLegacyGoogleProvider(id)) {
+			continue;
+		}
+		const adapter = getBuiltinOAuthAdapter(id);
+		if (adapter) {
+			providers.set(id, adapter);
+		}
+	}
+	for (const [id, provider] of extensionOAuthProviders) {
+		if (!isRemovedLegacyGoogleProvider(id)) {
+			providers.set(id, provider);
+		}
+	}
+	return [...providers.values()];
 }
 
 export function registerOAuthProvider(provider: OAuthProviderInterface): void {
-	registerOAuthProviderFromPiAi(provider);
+	extensionOAuthProviders.set(provider.id, provider);
 }
 
 export function unregisterOAuthProvider(id: OAuthProviderId): void {
-	unregisterOAuthProviderFromPiAi(id);
+	extensionOAuthProviders.delete(id);
 }
 
 export function resetOAuthProviders(): void {
-	resetOAuthProvidersFromPiAi();
+	extensionOAuthProviders.clear();
 }
 
 export interface OAuthRefreshExecutionOptions {
@@ -327,7 +484,7 @@ export async function refreshOAuthCredential(
 		return refreshOpenAICodexCredential(credentials, requestTimeoutMs);
 	}
 
-	const provider = getOAuthProviderFromPiAi(providerId);
+	const provider = getOAuthProvider(providerId);
 	if (!provider) {
 		throw new OAuthRefreshFailureError(
 			`OAuth provider is not available for token refresh: ${providerId}`,
@@ -347,6 +504,4 @@ export type {
 	OAuthCredentials,
 	OAuthDeviceCodeInfo,
 	OAuthLoginCallbacks,
-	OAuthProviderId,
-	OAuthProviderInterface,
 };
