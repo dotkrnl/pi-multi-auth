@@ -64,6 +64,7 @@ The following table shows credential and usage support for each recognized provi
 | xAI | ✅ | — | — | |
 | Xiaomi MiMo | ✅ | — | — | |
 | ZAI | ✅ | — | — | |
+| Z.AI Coding CN | ✅ | — | ✅ | GLM China coding plan; usage via `bigmodel.cn` `/api/monitor/usage/quota/limit` (5-hour request window + weekly token budget) |
 
 > **Legacy providers** `openai-codex` and `github-copilot` are retained for discovery and migration seed paths.
 > **Removed providers** Google Gemini CLI and Google Antigravity are filtered from credential setup and usage refreshes.

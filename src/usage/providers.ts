@@ -5,6 +5,7 @@ import { commandCodeUsageProvider } from "./command-code.js";
 import { copilotUsageProvider } from "./copilot.js";
 import { kimiCodingUsageProvider } from "./kimi-coding.js";
 import { kiroUsageProvider } from "./kiro.js";
+import { zaiCodingCnUsageProvider } from "./zai-coding-cn.js";
 import type { UsageAuth, UsageProvider } from "./types.js";
 
 // qwen remains intentionally excluded until it exposes a reliable
@@ -17,4 +18,5 @@ export const usageProviders: ReadonlyArray<UsageProvider<UsageAuth>> = [
 	commandCodeUsageProvider,
 	kiroUsageProvider,
 	blazeapiUsageProvider,
+	zaiCodingCnUsageProvider,
 ];
