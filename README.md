@@ -1,5 +1,13 @@
 # pi-multi-auth
 
+> **This is the [dotkrnl fork](https://github.com/dotkrnl/pi-multi-auth), ported to Pi 0.84.x.**
+> Upstream (MasuRii/pi-multi-auth 0.10.0) targets Pi 0.74–0.78 and does not run on Pi ≥ 0.80,
+> which removed the global OAuth provider registry this extension relied on.
+>
+> - Requires **Pi ≥ 0.84** (`@earendil-works/pi-ai` / `pi-coding-agent` / `pi-tui` `^0.84.0`).
+> - Install: `pi install github:dotkrnl/pi-multi-auth`
+> - Upstream project: https://github.com/MasuRii/pi-multi-auth
+
 [![npm version](https://img.shields.io/npm/v/pi-multi-auth?style=flat-square)](https://www.npmjs.com/package/pi-multi-auth) [![License](https://img.shields.io/github/license/MasuRii/pi-multi-auth?style=flat-square)](LICENSE)
 
 <img width="1024" height="506" alt="image" src="https://github.com/user-attachments/assets/1aff63b4-0e1e-4eaa-93b4-5f4f9188224b" />
@@ -86,7 +94,13 @@ pi-multi-auth/
 
 ## Installation
 
-### npm package
+### This fork (Pi 0.84+)
+
+```bash
+pi install github:dotkrnl/pi-multi-auth
+```
+
+### npm package (upstream, Pi 0.74–0.78)
 
 ```bash
 pi install npm:pi-multi-auth

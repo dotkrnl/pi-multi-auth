@@ -1,3 +1,6 @@
+import { watch, type FSWatcher } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { basename } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { AccountManager } from "./account-manager.js";
 import {
@@ -24,11 +27,20 @@ import {
 	isDelegatedSubagentRuntime,
 	resolveRequestedProviderFromArgv,
 } from "./runtime-context.js";
+import { resolveAgentRuntimePath } from "./runtime-paths.js";
+import {
+	formatQuotaStatusLine,
+	formatStatusReport,
+	summarizeProviderStatuses,
+} from "./status-summary.js";
 
 const STARTUP_WARMUP_DELAY_MS = 0;
 const STARTUP_REFINEMENT_DELAY_MS = 1_500;
 const RUNTIME_PROVIDER_REGISTRATION_EVENT = "pi-multi-auth:runtime-provider-registration";
 const PROVIDERS_REGISTERED_EVENT = "pi-multi-auth:providers-registered";
+const FOOTER_STATUS_KEY = "multi-auth";
+const FOOTER_REFRESH_INTERVAL_MS = 30_000;
+const AUTH_FILE_WATCH_DEBOUNCE_MS = 300;
 const FIRST_CLASS_OAUTH_PROVIDER_REGISTRARS: Readonly<Record<string, () => void>> = {
 	cline: registerClineOAuthProvider,
 	kilo: registerKiloOAuthProvider,
@@ -73,10 +85,21 @@ function registerLazyMultiAuthCommands(
 	accountManager: AccountManager,
 ): void {
 	pi.registerCommand("multi-auth", {
-		description: "Open unified multi-auth account manager modal",
+		description: "Open unified multi-auth account manager modal (or '/multi-auth status' for an inline report)",
 		handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
-			if (args.trim()) {
-				ctx.ui.notify("Usage: /multi-auth", "warning");
+			const trimmedArgs = args.trim();
+			if (trimmedArgs === "status") {
+				try {
+					const statuses = await accountManager.getStatus();
+					ctx.ui.notify(formatStatusReport(statuses), "info");
+				} catch (error) {
+					ctx.ui.notify(`/multi-auth status failed: ${getErrorMessage(error)}`, "error");
+				}
+				return;
+			}
+
+			if (trimmedArgs) {
+				ctx.ui.notify("Usage: /multi-auth [status]", "warning");
 				return;
 			}
 
@@ -322,6 +345,164 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 		scheduleRefinement(generation, onError);
 	};
 
+	// --- Footer quota indicator + live auth.json discovery (interactive runtimes) ---
+
+	type FooterUiContext = {
+		hasUI: boolean;
+		ui: { setStatus(key: string, text: string | undefined): void };
+	};
+
+	let footerCtx: FooterUiContext | null = null;
+	let footerRefreshTimer: ReturnType<typeof setInterval> | null = null;
+	let footerInitialTimer: ReturnType<typeof setTimeout> | null = null;
+	let footerRefreshInFlight: Promise<void> | null = null;
+	let authWatcher: FSWatcher | null = null;
+	let authWatchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+	let lastAuthFileFingerprint: string | null = null;
+
+	const refreshFooterStatus = async (): Promise<void> => {
+		const ctx = footerCtx;
+		if (!ctx?.hasUI) {
+			return;
+		}
+		if (footerRefreshInFlight) {
+			return footerRefreshInFlight;
+		}
+		footerRefreshInFlight = (async () => {
+			try {
+				const statuses = await accountManager.getStatus();
+				const line = formatQuotaStatusLine(summarizeProviderStatuses(statuses));
+				if (footerCtx === ctx) {
+					ctx.ui.setStatus(FOOTER_STATUS_KEY, line);
+				}
+			} catch (error) {
+				multiAuthDebugLogger.log("footer_status_refresh_failed", {
+					error: getErrorMessage(error),
+				});
+			}
+		})();
+		try {
+			await footerRefreshInFlight;
+		} finally {
+			footerRefreshInFlight = null;
+		}
+	};
+
+	const stopFooterStatus = (): void => {
+		if (footerRefreshTimer !== null) {
+			clearInterval(footerRefreshTimer);
+			footerRefreshTimer = null;
+		}
+		if (footerInitialTimer !== null) {
+			clearTimeout(footerInitialTimer);
+			footerInitialTimer = null;
+		}
+		if (footerCtx?.hasUI) {
+			footerCtx.ui.setStatus(FOOTER_STATUS_KEY, undefined);
+		}
+		footerCtx = null;
+	};
+
+	const startFooterStatus = (ctx: FooterUiContext): void => {
+		stopFooterStatus();
+		if (!ctx.hasUI) {
+			return;
+		}
+		footerCtx = ctx;
+		// Initial refresh once warmup has had a chance to populate usage caches;
+		// afterwards the interval re-reads cached snapshots (cheap, no network).
+		footerInitialTimer = setTimeout(() => {
+			footerInitialTimer = null;
+			void refreshFooterStatus();
+		}, STARTUP_REFINEMENT_DELAY_MS + 500);
+		footerRefreshTimer = setInterval(() => {
+			void refreshFooterStatus();
+		}, FOOTER_REFRESH_INTERVAL_MS);
+		footerRefreshTimer.unref?.();
+	};
+
+	const readAuthFileFingerprint = async (): Promise<string | null> => {
+		try {
+			const parsed: unknown = JSON.parse(await readFile(resolveAgentRuntimePath("auth.json"), "utf8"));
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+				return null;
+			}
+			// Only the credential-id set matters: token refreshes rewrite values
+			// without changing keys and must not trigger re-registration.
+			return Object.keys(parsed).sort().join("\n");
+		} catch {
+			return null;
+		}
+	};
+
+	const handleAuthFileChange = (): void => {
+		if (authWatchDebounceTimer !== null) {
+			clearTimeout(authWatchDebounceTimer);
+		}
+		authWatchDebounceTimer = setTimeout(() => {
+			authWatchDebounceTimer = null;
+			void (async () => {
+				const fingerprint = await readAuthFileFingerprint();
+				if (fingerprint === null || fingerprint === lastAuthFileFingerprint) {
+					return;
+				}
+				lastAuthFileFingerprint = fingerprint;
+				multiAuthDebugLogger.log("auth_file_credential_set_changed");
+				try {
+					await registerMultiAuthProviders(pi, accountManager, {
+						excludeProviders: [...excludedProviders],
+					});
+				} catch (error) {
+					multiAuthDebugLogger.log("auth_change_reregistration_failed", {
+						error: getErrorMessage(error),
+					});
+				}
+				await refreshFooterStatus();
+			})();
+		}, AUTH_FILE_WATCH_DEBOUNCE_MS);
+		authWatchDebounceTimer.unref?.();
+	};
+
+	const startAuthFileWatcher = (): void => {
+		if (authWatcher) {
+			return;
+		}
+		void (async () => {
+			lastAuthFileFingerprint = await readAuthFileFingerprint();
+		})();
+		try {
+			// Watch the directory: auth.json writes are atomic renames, which
+			// invalidate file-level watchers.
+			authWatcher = watch(resolveAgentRuntimePath(), (eventType, filename) => {
+				if (filename && basename(filename.toString()) === "auth.json") {
+					handleAuthFileChange();
+				}
+			});
+			authWatcher.on("error", (error) => {
+				multiAuthDebugLogger.log("auth_file_watch_error", {
+					error: getErrorMessage(error),
+				});
+			});
+			authWatcher.unref?.();
+		} catch (error) {
+			authWatcher = null;
+			multiAuthDebugLogger.log("auth_file_watch_start_failed", {
+				error: getErrorMessage(error),
+			});
+		}
+	};
+
+	const stopAuthFileWatcher = (): void => {
+		if (authWatchDebounceTimer !== null) {
+			clearTimeout(authWatchDebounceTimer);
+			authWatchDebounceTimer = null;
+		}
+		if (authWatcher) {
+			authWatcher.close();
+			authWatcher = null;
+		}
+	};
+
 	const shutdownExtension = async (onWarning?: (message: string) => void): Promise<void> => {
 		if (shutdownPromise) {
 			return shutdownPromise;
@@ -329,6 +510,8 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 
 		const generation = beginStartupWorkGeneration();
 		clearStartupTimers();
+		stopFooterStatus();
+		stopAuthFileWatcher();
 		shutdownPromise = (async () => {
 			try {
 				await accountManager.shutdown();
@@ -410,6 +593,8 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 		}
 
 		if (!isSubagentRuntime) {
+			startFooterStatus(ctx);
+			startAuthFileWatcher();
 			scheduleStartupWork(startupGeneration, (message) => {
 				ctx.ui.notify(`multi-auth initialization warning: ${message}`, "warning");
 			});

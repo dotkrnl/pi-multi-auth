@@ -755,7 +755,9 @@ export class UsageSnapshotCacheStore {
 			}
 			const key = createRecordKey(entry.provider, entry.credentialId, entry.credentialCacheKey);
 			const existing = latestByCredential.get(key);
-			if (!existing || compareEntriesForRetention(entry, existing) < 0) {
+			// <= so a later write wins an exact fetchedAt tie (same-millisecond
+			// refetch); entries arrive in chronological append order.
+			if (!existing || compareEntriesForRetention(entry, existing) <= 0) {
 				latestByCredential.set(key, entry);
 			}
 		}
@@ -778,7 +780,9 @@ export class UsageSnapshotCacheStore {
 			// replace older ones regardless of credentialCacheKey (token) changes.
 			const key = createRecordKey(entry.provider, entry.credentialId, "");
 			const existing = latestByCredential.get(key);
-			if (!existing || compareEntriesForRetention(entry, existing) < 0) {
+			// <= so a later write wins an exact fetchedAt tie (same-millisecond
+			// refetch); entries arrive in chronological append order.
+			if (!existing || compareEntriesForRetention(entry, existing) <= 0) {
 				latestByCredential.set(key, entry);
 			}
 		}

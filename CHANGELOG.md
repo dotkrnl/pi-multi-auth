@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.12.0 - 2026-08-11
+
+### Added
+- Footer quota indicator: active-account usage percentages (e.g. `kimi-coding×2:35%/27%w  openai-codex:7%`) are shown in the Pi footer via `ctx.ui.setStatus()`, refreshed every 30s and after credential-set changes, and cleared on session shutdown.
+- `/multi-auth status` subcommand prints an inline per-provider/per-account report (rotation mode, usage windows, plan, active/expired/quota-exhausted markers).
+- Live credential discovery: the runtime directory is watched for `auth.json` credential-set changes (atomic-rename safe, debounced, keyed on the credential-id set so token refreshes don't trigger churn) and provider wrappers re-register without a Pi restart.
+- Regression tests for same-millisecond usage-cache dedup and the status summary formatters.
+
+### Changed
+- `anthropic`, `github-copilot`, and `kimi-coding` now default to `usage-based` rotation (previously round-robin), matching their working quota endpoints.
+
+### Fixed
+- Usage cache dedup (`pruneEntries`/`pruneDisplayEntries`) now lets the later write win an exact `fetchedAt` tie. Previously two fetches within the same millisecond kept the stale entry, which made `usage-persistent-cache` ambiguity tests flaky (~17% failure rate) and could show a stale display snapshot after a rapid refetch.
+
 ## 0.11.0 - 2026-08-11
 
 ### Changed

@@ -18,6 +18,7 @@ import {
 } from "./openai-codex-import.js";
 import { runProviderConfigurationDialog } from "./provider-configuration-dialog.js";
 import { getErrorMessage } from "./auth-error-utils.js";
+import { formatStatusReport } from "./status-summary.js";
 import { parseApiKeyBatchInput } from "./credential-display.js";
 import { ModalVisibilityController } from "./modal-visibility.js";
 import { isRemovedLegacyGoogleProvider } from "./removed-google-providers.js";
@@ -3127,10 +3128,21 @@ export function registerMultiAuthCommands(
 	accountManager: AccountManager,
 ): void {
 	pi.registerCommand("multi-auth", {
-		description: "Open unified multi-auth account manager modal",
+		description: "Open unified multi-auth account manager modal (or '/multi-auth status' for an inline report)",
 		handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
-			if (args.trim()) {
-				ctx.ui.notify("Usage: /multi-auth", "warning");
+			const trimmedArgs = args.trim();
+			if (trimmedArgs === "status") {
+				try {
+					const statuses = await accountManager.getStatus();
+					ctx.ui.notify(formatStatusReport(statuses), "info");
+				} catch (error) {
+					ctx.ui.notify(`/multi-auth status failed: ${getErrorMessage(error)}`, "error");
+				}
+				return;
+			}
+
+			if (trimmedArgs) {
+				ctx.ui.notify("Usage: /multi-auth [status]", "warning");
 				return;
 			}
 
