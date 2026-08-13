@@ -58,6 +58,7 @@ import {
 	type CredentialRequestOverrides,
 	type CredentialStatus,
 	type MultiAuthState,
+	type OpenCodeGoQuotaConfig,
 	type ProviderCredentialLeaseState,
 	type ProviderRotationState,
 	type ProviderStatus,
@@ -2288,6 +2289,48 @@ export class AccountManager {
 	 */
 	hasUsageProvider(provider: SupportedProviderId): boolean {
 		return this.usageService.hasProvider(provider);
+	}
+
+	/**
+	 * Drops cached usage snapshots for one credential so the next read refetches
+	 * fresh data (used after credential-scoped config changes such as the
+	 * cookie-based OpenCode Go quota lookup).
+	 */
+	clearCredentialUsageCache(provider: SupportedProviderId, credentialId: string): void {
+		this.usageService.clearCredential(provider, credentialId);
+	}
+
+	/**
+	 * Reads the cookie-based OpenCode Go quota config stored on a credential.
+	 */
+	async getOpenCodeGoQuotaConfig(
+		provider: SupportedProviderId,
+		credentialId: string,
+	): Promise<OpenCodeGoQuotaConfig | undefined> {
+		const credential = await this.authWriter.getCredential(credentialId);
+		return credential?.opencodeGo;
+	}
+
+	/**
+	 * Persists the cookie-based OpenCode Go quota lookup config on a credential
+	 * and clears that credential's usage cache so the next read uses the new
+	 * workspace id + cookie. Pass empty values to clear.
+	 */
+	async setOpenCodeGoQuotaConfig(
+		provider: SupportedProviderId,
+		credentialId: string,
+		workspaceId: string,
+		cookie: string,
+	): Promise<OpenCodeGoQuotaConfig | null> {
+		const trimmedWorkspaceId = workspaceId.trim();
+		const trimmedCookie = cookie.trim();
+		const config =
+			trimmedWorkspaceId && trimmedCookie
+				? { workspaceId: trimmedWorkspaceId, cookie: trimmedCookie }
+				: null;
+		await this.authWriter.setOpenCodeGoQuotaConfig(credentialId, config);
+		this.clearCredentialUsageCache(provider, credentialId);
+		return config ? { ...config } : null;
 	}
 
 	async flushLightweightRotationState(provider?: SupportedProviderId): Promise<void> {
@@ -5896,6 +5939,7 @@ export class AccountManager {
 				usageSnapshotDisplayOnly: usage?.displayOnly,
 				usageFetchError: usage?.error ?? undefined,
 				disabledError,
+				opencodeGoWorkspaceId: credential.opencodeGo?.workspaceId,
 			});
 		}
 

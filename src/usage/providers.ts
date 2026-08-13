@@ -5,6 +5,7 @@ import { commandCodeUsageProvider } from "./command-code.js";
 import { copilotUsageProvider } from "./copilot.js";
 import { kimiCodingUsageProvider } from "./kimi-coding.js";
 import { kiroUsageProvider } from "./kiro.js";
+import { opencodeGoUsageProvider } from "./opencode-go.js";
 import { zaiCodingCnUsageProvider } from "./zai-coding-cn.js";
 import type { UsageAuth, UsageProvider } from "./types.js";
 
@@ -19,4 +20,5 @@ export const usageProviders: ReadonlyArray<UsageProvider<UsageAuth>> = [
 	kiroUsageProvider,
 	blazeapiUsageProvider,
 	zaiCodingCnUsageProvider,
+	opencodeGoUsageProvider,
 ];

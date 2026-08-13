@@ -1291,6 +1291,13 @@ class MultiAuthManagerModal {
 		return this.getSelectedEntry(status).kind;
 	}
 
+	private isSelectedAccountCookieQuotaCapable(status: ProviderStatus | null): boolean {
+		if (!status || status.provider !== "opencode-go") {
+			return false;
+		}
+		return this.getSelectedEntry(status).kind === "account";
+	}
+
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, Math.floor(width));
 		const lines: string[] = [];
@@ -1366,6 +1373,7 @@ class MultiAuthManagerModal {
 				selectedProviderStatus !== null && this.getBatchSelectedCredentialIds(selectedProviderStatus).length > 0,
 			selectedAccountMarked:
 				selectedProviderStatus !== null && this.isSelectedAccountMarked(selectedProviderStatus),
+			selectedAccountSupportsCookieQuota: this.isSelectedAccountCookieQuotaCapable(selectedProviderStatus),
 		});
 		const wrapped = renderWrappedFooterActions(actions, lineWidth);
 		if (wrapped.length === 0) {
@@ -1461,6 +1469,11 @@ class MultiAuthManagerModal {
 
 		if (matchesKey(data, "e")) {
 			this.reenableSelectedAccount();
+			return;
+		}
+
+		if (matchesKey(data, "c")) {
+			void this.configureSelectedOpenCodeGoQuota();
 			return;
 		}
 
@@ -1781,6 +1794,11 @@ class MultiAuthManagerModal {
 			`Rotation:  ${formatRotationModeLabel(status.rotationMode)}`,
 			`Usage:     ${selectedCredential.usageCount} usage units`,
 			...(duplicateDetailLine ? [duplicateDetailLine] : []),
+			...(selectedCredential.opencodeGoWorkspaceId
+				? [`Quota:     workspace ${selectedCredential.opencodeGoWorkspaceId} (cookie set, [c] to edit)`]
+				: status.provider === "opencode-go"
+					? [`Quota:     ${this.theme.fg("warning", "no cookie configured (press [c])")}`]
+					: []),
 		];
 		if (hasUsageApi) {
 			detailLines.push(
@@ -2468,6 +2486,83 @@ class MultiAuthManagerModal {
 			return;
 		}
 		this.startRenameEditor(status.provider, selectedEntry.credential);
+	}
+
+	private async configureSelectedOpenCodeGoQuota(): Promise<void> {
+		const status = this.getSelectedProviderStatus();
+		if (!status) {
+			return;
+		}
+		if (status.provider !== "opencode-go") {
+			this.ctx.ui.notify(
+				"Cookie-based quota lookup only applies to OpenCode Go accounts.",
+				"warning",
+			);
+			return;
+		}
+		const selectedEntry = this.getSelectedEntry(status);
+		if (selectedEntry.kind !== "account") {
+			this.ctx.ui.notify("Select an OpenCode Go account to configure its quota lookup.", "warning");
+			return;
+		}
+		const credential = selectedEntry.credential;
+		const credentialLabel = formatCredentialDisplayName(credential.credentialId, credential.friendlyName);
+
+		let current: { workspaceId: string; cookie: string };
+		try {
+			const stored = await this.accountManager.getOpenCodeGoQuotaConfig(status.provider, credential.credentialId);
+			current = stored ?? { workspaceId: "", cookie: "" };
+		} catch (error) {
+			this.ctx.ui.notify(`Failed to read OpenCode Go quota config: ${getErrorMessage(error)}`, "error");
+			return;
+		}
+
+		const configuredHint = current.workspaceId
+			? `Current workspace: ${current.workspaceId} (cookie set).`
+			: "No workspace id or cookie configured yet.";
+		this.ctx.ui.notify(`OpenCode Go quota for ${credentialLabel}. ${configuredHint}`, "info");
+
+		const workspaceIdInput = await this.ctx.ui.input(
+			"OpenCode Go workspace id (e.g. wrk_01EXAMPLE0EXAMPLE0EXAMPLE0EXAMPL):",
+			current.workspaceId,
+		);
+		if (workspaceIdInput === undefined) {
+			this.ctx.ui.notify("OpenCode Go quota config cancelled.", "warning");
+			return;
+		}
+		const workspaceId = workspaceIdInput.trim();
+
+		const cookiePrompt = workspaceId
+			? `Paste the OpenCode Go dashboard \`auth\` cookie for ${workspaceId}.
+It looks like \`Fe26.2**…\` (browser devtools → Cookies → opencode.ai → \`auth\`).
+Leave blank and save to clear the stored cookie.`
+			: "Leave blank and save to clear the stored workspace id and cookie.";
+		const cookieInput = await this.ctx.ui.editor(cookiePrompt, current.cookie);
+		if (cookieInput === undefined) {
+			this.ctx.ui.notify("OpenCode Go quota config cancelled.", "warning");
+			return;
+		}
+		// The editor may wrap the pasted cookie; collapse stray whitespace/newlines.
+		const cookie = cookieInput.replace(/\s+/g, "").trim();
+
+		const preserveSelection: SelectionAnchor = {
+			provider: status.provider,
+			kind: "account",
+			credentialId: credential.credentialId,
+		};
+		this.runAction(`Saving OpenCode Go quota config for ${credentialLabel}...`, async () => {
+			const persisted = await this.accountManager.setOpenCodeGoQuotaConfig(
+				status.provider,
+				credential.credentialId,
+				workspaceId,
+				cookie,
+			);
+			await this.reloadStatuses(preserveSelection);
+			if (!persisted) {
+				return `Cleared OpenCode Go quota lookup for ${credentialLabel}.`;
+			}
+			return `Saved OpenCode Go quota config for ${credentialLabel} (workspace ${persisted.workspaceId}).`;
+		});
 	}
 
 	private startRenameEditor(provider: SupportedProviderId, credential: CredentialStatus): void {

@@ -21,6 +21,7 @@ import {
 import type {
 	BackupAndStoreResult,
 	CredentialRequestOverrides,
+	OpenCodeGoQuotaConfig,
 	StoredApiKeyCredential,
 	StoredAuthCredential,
 	StoredOAuthCredential,
@@ -394,6 +395,52 @@ export class AuthWriter {
 					...request,
 				},
 			};
+			const next = cloneAuthData(data);
+			next[normalizedCredentialId] = nextCredential;
+			return {
+				result: cloneStoredCredential(nextCredential),
+				next,
+			};
+		});
+	}
+
+	/**
+	 * Persists the cookie-based OpenCode Go quota lookup config on a credential,
+	 * preserving the credential secret and any sibling request overrides. Pass
+	 * `null` to clear the stored workspace id and cookie.
+	 */
+	async setOpenCodeGoQuotaConfig(
+		credentialId: string,
+		config: OpenCodeGoQuotaConfig | null,
+	): Promise<StoredAuthCredential> {
+		const normalizedCredentialId = credentialId.trim();
+		if (!normalizedCredentialId) {
+			throw new Error("Credential ID cannot be empty.");
+		}
+		if (config !== null) {
+			const workspaceId = config.workspaceId.trim();
+			const cookie = config.cookie.trim();
+			if (!workspaceId || !cookie) {
+				throw new Error("OpenCode Go workspace id and cookie are both required.");
+			}
+			config = { workspaceId, cookie };
+		}
+
+		return this.withLock((data) => {
+			const existing = data[normalizedCredentialId];
+			if (!isStoredCredential(existing)) {
+				throw new Error(
+					`Credential ${normalizedCredentialId} is missing from auth.json. Open /multi-auth and add the account again if needed.`,
+				);
+			}
+
+			const base = cloneStoredCredential(existing);
+			if (config === null) {
+				delete base.opencodeGo;
+			} else {
+				base.opencodeGo = config;
+			}
+			const nextCredential: StoredAuthCredential = base;
 			const next = cloneAuthData(data);
 			next[normalizedCredentialId] = nextCredential;
 			return {

@@ -56,7 +56,7 @@ The following table shows credential and usage support for each recognized provi
 | Mistral | ✅ | — | — | |
 | OpenAI | ✅ | — | ✅ | Usage via Codex entitlement |
 | OpenAI Codex | ✅ | — | ✅ | Legacy discovery; Codex usage + entitlement |
-| OpenCode Go | ✅ | — | — | |
+| OpenCode Go | ✅ | — | ✅ | Usage via cookie-authenticated dashboard HTML (rolling 5h + weekly windows); configure with `/multi-auth opencode-go` |
 | OpenCode Zen | ✅ | — | — | |
 | OpenRouter | ✅ | — | — | |
 | Qwen | — | ✅ | — | OAuth only; device code with PKCE |
@@ -132,7 +132,20 @@ Runtime configuration lives in `config.json` at the extension root. The extensio
 
 The published package intentionally excludes `config.json` and `debug/`; both are created locally as needed by the running extension. Usage snapshots are cached in Pi's runtime directory as `multi-auth-usage-cache.json` so operational and display-only usage state can survive extension restarts without publishing local state.
 
-### Credential request overrides
+### Cookie-based OpenCode Go quota lookup
+
+OpenCode Go does not expose a public quota API keyed on the model access key. Instead the Go plan dashboard (`https://opencode.ai/workspace/<workspaceId>/go`) renders quota server-side from the browser `auth` session cookie. pi-multi-auth reads that dashboard HTML and parses the rolling 5-hour and weekly usage windows plus the prepaid credit balance.
+
+Each OpenCode Go account carries its own workspace id + cookie (one credential = one workspace), configured per-credential from the `/multi-auth` modal:
+
+1. Open `/multi-auth` and select the OpenCode Go account.
+2. Press **`[c]`** (Cookie Quota).
+3. Enter the **workspace id** — the `wrk_...` id from your dashboard URL (e.g. `https://opencode.ai/workspace/wrk_01EXAMPLE0EXAMPLE0EXAMPLE0EXAMPL/go`).
+4. Paste the **cookie** — the value of the `auth` cookie for `https://opencode.ai` (a long opaque string starting with `Fe26.2**…`). Open browser devtools → Application/Storage → Cookies → `opencode.ai` → copy the `auth` cookie value.
+
+The values are stored on the credential in `auth.json` under an `opencodeGo` field and never published. Leave both blank to clear them for that account. The account's detail pane shows `Quota: workspace <id> (cookie set)` once configured, or `Quota: no cookie configured (press [c])`. Each configured OpenCode Go account defaults to usage-based rotation; unconfigured accounts report no quota and fall back to round-robin.
+
+### Credential request overrides### Credential request overrides
 
 Credentials may include a `request` object with provider-specific request settings:
 

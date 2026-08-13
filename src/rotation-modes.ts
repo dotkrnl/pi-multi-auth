@@ -9,6 +9,10 @@ const PROVIDER_DEFAULT_ROTATION_MODES: Partial<Record<SupportedProviderId, Rotat
 	anthropic: "usage-based",
 	"github-copilot": "usage-based",
 	"kimi-coding": "usage-based",
+	// OpenCode Go quota is read from the cookie-authenticated dashboard; usage-
+	// based rotation only engages once a workspace id + cookie are configured,
+	// otherwise the provider reports no quota and rotation falls back gracefully.
+	"opencode-go": "usage-based",
 };
 
 const STANDARD_ROTATION_MODES: RotationMode[] = ["round-robin", "usage-based"];

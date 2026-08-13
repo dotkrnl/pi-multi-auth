@@ -29,9 +29,26 @@ export interface CredentialRequestOverrides {
 	headers?: Record<string, string>;
 }
 
+/**
+ * Per-credential cookie-based OpenCode Go (opencode.ai) quota lookup config.
+ *
+ * OpenCode Go has no public quota API keyed on the model access key, so quota
+ * is read from the authenticated workspace dashboard HTML using the browser
+ * `auth` session cookie. Each OpenCode Go credential carries the workspace id
+ * and cookie for its own workspace.
+ */
+export interface OpenCodeGoQuotaConfig {
+	/** Workspace id, e.g. `wrk_01EXAMPLE0EXAMPLE0EXAMPLE0EXAMPL`. */
+	workspaceId: string;
+	/** Browser `auth` session cookie value from opencode.ai. */
+	cookie: string;
+}
+
 export interface StoredCredentialRequestConfig {
 	/** Optional request overrides that travel with a single credential. */
 	request?: CredentialRequestOverrides;
+	/** Cookie-based OpenCode Go quota lookup (opencode-go credentials only). */
+	opencodeGo?: OpenCodeGoQuotaConfig;
 }
 
 /** OAuth credential payload stored in auth.json entries. */
@@ -190,6 +207,8 @@ export interface CredentialStatus {
 	usageSnapshotDisplayOnly?: boolean;
 	usageFetchError?: string;
 	disabledError?: string;
+	/** OpenCode Go workspace id when cookie-based quota lookup is configured. */
+	opencodeGoWorkspaceId?: string;
 }
 
 /** Readable provider status for command output. */

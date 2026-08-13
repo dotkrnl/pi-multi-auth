@@ -21,6 +21,8 @@ export interface FooterActionOptions {
 	showDisabledAccounts: boolean;
 	hasBatchSelection: boolean;
 	selectedAccountMarked: boolean;
+	/** True when the selected account supports an extra per-credential action. */
+	selectedAccountSupportsCookieQuota?: boolean;
 }
 
 export interface ProviderVisibilitySummary<TStatus extends ProviderLike = ProviderLike> {
@@ -141,6 +143,9 @@ export function resolveFooterActions(options: FooterActionOptions): string[] {
 				"[T] Refresh Selected",
 				options.hasBatchSelection ? "[d] Delete Marked" : "[d] Delete",
 			);
+			if (options.selectedAccountSupportsCookieQuota) {
+				actions.push("[c] Cookie Quota");
+			}
 		} else if (options.selectedEntryKind === "add") {
 			actions.push("[Enter] Add");
 			if (options.hasBatchSelection) {

@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+- Cookie-based OpenCode Go quota lookup. OpenCode Go has no public quota API keyed on the model access key, so the rolling 5-hour and weekly usage windows (plus the prepaid credit balance) are now read from the cookie-authenticated Go plan dashboard HTML at `https://opencode.ai/workspace/<workspaceId>/go`. Each OpenCode Go credential carries its own workspace id + browser `auth` session cookie (one credential = one workspace), configured per-account from the `/multi-auth` modal with the new `[c]` (Cookie Quota) action; values persist on the credential in `auth.json` under an `opencodeGo` field. Configured OpenCode Go accounts default to `usage-based` rotation; unconfigured accounts report no quota and fall back to round-robin.
+
 ### Fixed
 - Z.AI Coding CN (GLM bigmodel.cn) quota windows were mapped to the wrong limit buckets. The monitor endpoint reports three buckets: a `TIME_LIMIT` row for the MCP tool pool (web-search / web-reader / zread) and two `TOKENS_LIMIT` rows keyed by `unit`/`number` — `(3, 5)` for the rolling 5-hour model token budget and `(6, 1)` for the weekly budget. Previously the MCP pool was shown as the 5-hour window (a gauge stuck at 0% for coding traffic) and the 5-hour token budget was mislabeled as the weekly window, while the real weekly budget was dropped entirely. The snapshot now reports the 5-hour token budget as the primary window and the weekly token budget as the secondary window, excludes the MCP pool, and surfaces the account plan tier (`level`) as the plan type.
 
