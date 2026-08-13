@@ -111,10 +111,14 @@ function formatUsageGroup(summary: ProviderUsageSummary): string | null {
 		parts.push(`${Math.round(summary.primaryPercent)}`);
 	}
 	if (typeof summary.secondaryPercent === "number") {
-		parts.push(`${Math.round(summary.secondaryPercent)}${formatWindowSuffix(summary.secondaryWindowMinutes)}`);
+		// Secondary is conventionally the weekly/long window; fall back to `w`
+		// when the provider's snapshot omits windowMinutes (e.g. kimi-coding).
+		const secondarySuffix = formatWindowSuffix(summary.secondaryWindowMinutes) || "w";
+		parts.push(`${Math.round(summary.secondaryPercent)}${secondarySuffix}`);
 	}
 	if (typeof summary.monthlyPercent === "number") {
-		parts.push(`${Math.round(summary.monthlyPercent)}${formatWindowSuffix(summary.monthlyWindowMinutes)}`);
+		const monthlySuffix = formatWindowSuffix(summary.monthlyWindowMinutes) || "m";
+		parts.push(`${Math.round(summary.monthlyPercent)}${monthlySuffix}`);
 	}
 	return parts.length > 0 ? parts.join("/") : null;
 }

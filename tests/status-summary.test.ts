@@ -234,3 +234,32 @@ test("formatQuotaStatusLine renders primary/weekly/monthly for OpenCode Go", () 
 	// count badge and no `%` signs.
 	assert.equal(line, "go|12/24w/36m  kimi|54/85w");
 });
+
+test("formatQuotaStatusLine shows weekly suffix even when windowMinutes is unknown", () => {
+	// kimi-coding's snapshot can carry windowMinutes: null for the secondary
+	// window; the statusline must still render the `w` slot suffix.
+	const now = Date.now();
+	const statuses = [
+		providerStatus({
+			provider: "kimi-coding",
+			credentials: [
+				credential({
+					credentialId: "kimi-coding",
+					isActive: true,
+					usageSnapshot: {
+						timestamp: 1,
+						provider: "kimi-coding",
+						planType: null,
+						primary: { usedPercent: 54, windowMinutes: 300, resetsAt: null },
+						secondary: { usedPercent: 85, windowMinutes: null, resetsAt: null },
+						credits: null,
+						copilotQuota: null,
+						updatedAt: 1,
+					},
+				}),
+			],
+		}),
+	];
+	const line = formatQuotaStatusLine(summarizeProviderStatuses(statuses, now));
+	assert.equal(line, "kimi|54/85w");
+});
