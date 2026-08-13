@@ -92,7 +92,7 @@ test("formatQuotaStatusLine compacts providers and marks quota exhaustion", () =
 		}),
 	];
 	const line = formatQuotaStatusLine(summarizeProviderStatuses(statuses, now));
-	assert.equal(line, "kimi×2|100%!");
+	assert.equal(line, "kimi|100!");
 });
 
 test("formatQuotaStatusLine renders short provider aliases", () => {
@@ -134,7 +134,7 @@ test("formatQuotaStatusLine renders short provider aliases", () => {
 		}),
 	];
 	const line = formatQuotaStatusLine(summarizeProviderStatuses(statuses, now));
-	assert.equal(line, "gpt|14%  glm|14%  custom-provider|14%");
+	assert.equal(line, "gpt|14  glm|14  custom-provider|14");
 });
 
 test("formatProviderStatuslineAlias maps known providers and falls back to the id", () => {
@@ -184,4 +184,53 @@ test("formatStatusReport lists providers, credentials, and usage windows", () =>
 
 test("formatStatusReport handles empty state", () => {
 	assert.equal(formatStatusReport([]), "multi-auth: no credentials configured.");
+});
+
+test("formatQuotaStatusLine renders primary/weekly/monthly for OpenCode Go", () => {
+	const now = Date.now();
+	const statuses = [
+		providerStatus({
+			provider: "opencode-go",
+			credentials: [
+				credential({
+					credentialId: "opencode-go",
+					isActive: true,
+					usageSnapshot: {
+						timestamp: 1,
+						provider: "opencode-go",
+						planType: "Go",
+						primary: { usedPercent: 12, windowMinutes: 5 * 60, resetsAt: null },
+						secondary: { usedPercent: 24, windowMinutes: 7 * 24 * 60, resetsAt: null },
+						monthly: { usedPercent: 36, windowMinutes: 30 * 24 * 60, resetsAt: null },
+						credits: null,
+						copilotQuota: null,
+						updatedAt: 1,
+					},
+				}),
+			],
+		}),
+		providerStatus({
+			provider: "kimi-coding",
+			credentials: [
+				credential({
+					credentialId: "kimi-coding",
+					isActive: true,
+					usageSnapshot: {
+						timestamp: 1,
+						provider: "kimi-coding",
+						planType: null,
+						primary: { usedPercent: 54, windowMinutes: 5 * 60, resetsAt: null },
+						secondary: { usedPercent: 85, windowMinutes: 7 * 24 * 60, resetsAt: null },
+						credits: null,
+						copilotQuota: null,
+						updatedAt: 1,
+					},
+				}),
+			],
+		}),
+	];
+	const line = formatQuotaStatusLine(summarizeProviderStatuses(statuses, now));
+	// Primary window is bare; weekly carries `w`, monthly carries `m`; no account
+	// count badge and no `%` signs.
+	assert.equal(line, "go|12/24w/36m  kimi|54/85w");
 });

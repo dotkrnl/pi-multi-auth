@@ -15,6 +15,14 @@ export interface ProviderUsageSummary {
 	primaryPercent?: number;
 	/** Active credential's secondary (long/weekly) window usage, 0-100. */
 	secondaryPercent?: number;
+	/** Active credential's tertiary (monthly) window usage, 0-100. */
+	monthlyPercent?: number;
+	/** Active credential's primary window length in minutes (for statusline suffixes). */
+	primaryWindowMinutes?: number;
+	/** Active credential's secondary window length in minutes (for statusline suffixes). */
+	secondaryWindowMinutes?: number;
+	/** Active credential's monthly window length in minutes (for statusline suffixes). */
+	monthlyWindowMinutes?: number;
 	planType?: string;
 	/** True when the active credential is in a quota cooldown. */
 	activeQuotaExhausted: boolean;
@@ -63,6 +71,10 @@ export function summarizeProviderStatuses(
 			activeLabel: credentialLabel(active),
 			primaryPercent: snapshot?.primary?.usedPercent,
 			secondaryPercent: snapshot?.secondary?.usedPercent,
+			monthlyPercent: snapshot?.monthly?.usedPercent,
+			primaryWindowMinutes: snapshot?.primary?.windowMinutes ?? undefined,
+			secondaryWindowMinutes: snapshot?.secondary?.windowMinutes ?? undefined,
+			monthlyWindowMinutes: snapshot?.monthly?.windowMinutes ?? undefined,
 			planType: snapshot?.planType ?? active.identityPlanType,
 			activeQuotaExhausted:
 				typeof active.quotaExhaustedUntil === "number" && active.quotaExhaustedUntil > now,
@@ -72,13 +84,37 @@ export function summarizeProviderStatuses(
 	return summaries;
 }
 
-function formatCompactPercent(summary: ProviderUsageSummary): string | null {
+/**
+ * Single-letter statusline suffix for a window length: `h`ourly, `d`aily,
+ * `w`eekly, `m`onthly. Returns an empty string for unknown/short windows so the
+ * primary (short) window renders bare (e.g. `54`, not `54h`).
+ */
+function formatWindowSuffix(windowMinutes?: number): string {
+	if (typeof windowMinutes !== "number" || !Number.isFinite(windowMinutes) || windowMinutes <= 0) {
+		return "";
+	}
+	if (windowMinutes >= 25 * 24 * 60) {
+		return "m";
+	}
+	if (windowMinutes >= 5 * 24 * 60) {
+		return "w";
+	}
+	if (windowMinutes >= 20 * 60) {
+		return "d";
+	}
+	return "h";
+}
+
+function formatUsageGroup(summary: ProviderUsageSummary): string | null {
 	const parts: string[] = [];
 	if (typeof summary.primaryPercent === "number") {
-		parts.push(`${Math.round(summary.primaryPercent)}%`);
+		parts.push(`${Math.round(summary.primaryPercent)}`);
 	}
 	if (typeof summary.secondaryPercent === "number") {
-		parts.push(`${Math.round(summary.secondaryPercent)}%w`);
+		parts.push(`${Math.round(summary.secondaryPercent)}${formatWindowSuffix(summary.secondaryWindowMinutes)}`);
+	}
+	if (typeof summary.monthlyPercent === "number") {
+		parts.push(`${Math.round(summary.monthlyPercent)}${formatWindowSuffix(summary.monthlyWindowMinutes)}`);
 	}
 	return parts.length > 0 ? parts.join("/") : null;
 }
@@ -115,21 +151,21 @@ export function formatProviderStatuslineAlias(provider: string): string {
 }
 
 /**
- * Compact single-line footer text, e.g. "kimi×2|35%/27%w  gpt|7%".
- * Returns undefined when no provider has usage data worth showing.
+ * Compact single-line footer text, e.g. "kimi|54/85w  go|12/24w/36m  gpt|7".
+ * The primary (short) window is bare; secondary and monthly windows carry a
+ * size suffix (`w`/`m`). Returns undefined when no provider has usage data.
  */
 export function formatQuotaStatusLine(
 	summaries: readonly ProviderUsageSummary[],
 ): string | undefined {
 	const segments: string[] = [];
 	for (const summary of summaries) {
-		const percent = formatCompactPercent(summary);
-		if (!percent) {
+		const usage = formatUsageGroup(summary);
+		if (!usage) {
 			continue;
 		}
-		const accountBadge = summary.accountCount > 1 ? `×${summary.accountCount}` : "";
 		const exhaustedMarker = summary.activeQuotaExhausted ? "!" : "";
-		segments.push(`${formatProviderStatuslineAlias(summary.provider)}${accountBadge}|${percent}${exhaustedMarker}`);
+		segments.push(`${formatProviderStatuslineAlias(summary.provider)}|${usage}${exhaustedMarker}`);
 	}
 	return segments.length > 0 ? segments.join("  ") : undefined;
 }
