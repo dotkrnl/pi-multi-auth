@@ -142,6 +142,7 @@ test("formatProviderStatuslineAlias maps known providers and falls back to the i
 	assert.equal(formatProviderStatuslineAlias("anthropic"), "claude");
 	assert.equal(formatProviderStatuslineAlias("kimi-coding"), "kimi");
 	assert.equal(formatProviderStatuslineAlias("zai-coding-cn"), "glm");
+	assert.equal(formatProviderStatuslineAlias("opencode-go"), "go");
 	assert.equal(formatProviderStatuslineAlias("unknown-provider"), "unknown-provider");
 });
 

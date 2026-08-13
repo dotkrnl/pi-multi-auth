@@ -97,6 +97,7 @@ const PROVIDER_STATUSLINE_ALIASES: Readonly<Record<string, string>> = {
 	"google-vertex": "vertex",
 	"kimi-coding": "kimi",
 	"minimax-cn": "minimax",
+	"opencode-go": "go",
 	"moonshotai-cn": "moonshot",
 	openai: "gpt",
 	"openai-codex": "gpt",
