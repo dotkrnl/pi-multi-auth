@@ -52,6 +52,8 @@ export interface UsageSnapshot {
 	planType: string | null;
 	primary: RateLimitWindow | null;
 	secondary: RateLimitWindow | null;
+	/** Optional tertiary window (e.g. OpenCode Go monthly). Omitted by most providers. */
+	monthly?: RateLimitWindow | null;
 	credits: UsageCredits | null;
 	copilotQuota: CopilotQuota | null;
 	updatedAt: number;

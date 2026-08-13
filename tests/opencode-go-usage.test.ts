@@ -117,6 +117,11 @@ test("opencode-go usage provider parses the dashboard hydration state", async (t
 	assert.equal(snapshot.secondary?.usedPercent, 17);
 	assert.equal(snapshot.secondary?.windowMinutes, 7 * 24 * 60);
 
+	// Monthly window is surfaced as the tertiary gauge.
+	assert.equal(snapshot.monthly?.usedPercent, 25);
+	assert.equal(snapshot.monthly?.windowMinutes, 30 * 24 * 60);
+	assert.ok(snapshot.monthly?.resetsAt !== null);
+
 	// Balance of 0 means no credits are reported.
 	assert.equal(snapshot.credits, null);
 });

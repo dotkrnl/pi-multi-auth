@@ -297,9 +297,16 @@ function parseUsageSnapshot(value: unknown): UsageSnapshot | null {
 
 	const primary = parseRateLimitWindow(value.primary);
 	const secondary = parseRateLimitWindow(value.secondary);
+	const monthly = parseRateLimitWindow(value.monthly);
 	const credits = parseCredits(value.credits);
 	const copilotQuota = parseCopilotQuota(value.copilotQuota);
-	if (primary === undefined || secondary === undefined || credits === undefined || copilotQuota === undefined) {
+	if (
+		primary === undefined ||
+		secondary === undefined ||
+		(value.monthly !== undefined && monthly === undefined) ||
+		credits === undefined ||
+		copilotQuota === undefined
+	) {
 		return null;
 	}
 
@@ -321,6 +328,7 @@ function parseUsageSnapshot(value: unknown): UsageSnapshot | null {
 		planType: value.planType,
 		primary,
 		secondary,
+		...(monthly !== undefined ? { monthly } : {}),
 		credits,
 		copilotQuota,
 		updatedAt: value.updatedAt,

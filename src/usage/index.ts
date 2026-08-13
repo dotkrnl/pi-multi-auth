@@ -112,6 +112,7 @@ function getSoonestResetAt(snapshot: UsageSnapshot | null): number | null {
 	const candidates = [
 		snapshot.primary?.resetsAt,
 		snapshot.secondary?.resetsAt,
+		snapshot.monthly?.resetsAt,
 		snapshot.copilotQuota?.resetAt,
 		snapshot.estimatedResetAt,
 		snapshot.rateLimitHeaders?.resetAt,

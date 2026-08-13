@@ -16,9 +16,7 @@ import type { RateLimitWindow, UsageAuth, UsageCredits, UsageProvider, UsageSnap
  *
  * - `rollingUsage` — the rolling 5-hour request window (primary).
  * - `weeklyUsage` — the weekly request window (secondary).
- * - `monthlyUsage` — the monthly request window (the two-window snapshot shape
- *   cannot carry a third independent gauge, so only the rolling + weekly
- *   windows are surfaced).
+ * - `monthlyUsage` — the monthly request window (tertiary `monthly` gauge).
  * - `balance` — remaining prepaid credit balance, reported as `credits`.
  *
  * The workspace id and cookie are stored per-credential on the OpenCode Go
@@ -35,6 +33,8 @@ const REQUEST_TIMEOUT_MS = 6_000;
 const ROLLING_WINDOW_MINUTES = 5 * 60;
 /** Weekly OpenCode Go request window length, in minutes. */
 const WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
+/** Monthly OpenCode Go request window length, in minutes. */
+const MONTHLY_WINDOW_MINUTES = 30 * 24 * 60;
 
 interface ParsedUsageWindow {
 	status: string | null;
@@ -147,8 +147,9 @@ function buildUsageCredits(balanceCents: number | null): UsageCredits | null {
 function getEstimatedResetAt(
 	primary: RateLimitWindow | null,
 	secondary: RateLimitWindow | null,
+	monthly: RateLimitWindow | null,
 ): number | undefined {
-	const resets = [primary?.resetsAt, secondary?.resetsAt].filter(
+	const resets = [primary?.resetsAt, secondary?.resetsAt, monthly?.resetsAt].filter(
 		(value): value is number => typeof value === "number" && Number.isFinite(value),
 	);
 	return resets.length > 0 ? Math.min(...resets) : undefined;
@@ -225,9 +226,11 @@ export const opencodeGoUsageProvider: UsageProvider<UsageAuth> = {
 		const now = Date.now();
 		const rolling = extractUsageObject(html, "rollingUsage");
 		const weekly = extractUsageObject(html, "weeklyUsage");
+		const monthlyRaw = extractUsageObject(html, "monthlyUsage");
 		const primary = toRateLimitWindow(rolling, ROLLING_WINDOW_MINUTES, now);
 		const secondary = toRateLimitWindow(weekly, WEEKLY_WINDOW_MINUTES, now);
-		if (!primary && !secondary) {
+		const monthly = toRateLimitWindow(monthlyRaw, MONTHLY_WINDOW_MINUTES, now);
+		if (!primary && !secondary && !monthly) {
 			throw new Error("OpenCode Go quota response format was invalid");
 		}
 
@@ -241,10 +244,11 @@ export const opencodeGoUsageProvider: UsageProvider<UsageAuth> = {
 			planType: OPENCODE_GO_PLAN_TYPE,
 			primary,
 			secondary,
+			monthly,
 			credits,
 			copilotQuota: null,
 			updatedAt: now,
-			estimatedResetAt: getEstimatedResetAt(primary, secondary),
+			estimatedResetAt: getEstimatedResetAt(primary, secondary, monthly),
 			quotaClassification,
 		};
 	},

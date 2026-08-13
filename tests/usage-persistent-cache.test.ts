@@ -1387,6 +1387,7 @@ test("usage cache round-trips snapshots with copilot quota and rate limit header
 		planType: "pro",
 		primary: { usedPercent: 75, windowMinutes: 60, resetsAt: now + 3_600_000 },
 		secondary: { usedPercent: 50, windowMinutes: 60, resetsAt: now + 3_600_000 },
+		monthly: { usedPercent: 36, windowMinutes: 30 * 24 * 60, resetsAt: now + 86_400_000 },
 		credits: { hasCredits: true, unlimited: false, balance: "42.50" },
 		copilotQuota: {
 			chat: { used: 100, total: 200, remaining: 100, percentUsed: 50, unlimited: false },
@@ -1445,6 +1446,11 @@ test("usage cache round-trips snapshots with copilot quota and rate limit header
 	assert.equal(entry?.result.snapshot?.rateLimitHeaders?.remaining, 25);
 	assert.equal(entry?.result.snapshot?.rateLimitHeaders?.confidence, "high");
 	assert.equal(entry?.result.snapshot?.rateLimitHeaders?.source, "retry-after");
+
+	// Verify the tertiary monthly window round-trips
+	assert.equal(entry?.result.snapshot?.monthly?.usedPercent, 36);
+	assert.equal(entry?.result.snapshot?.monthly?.windowMinutes, 30 * 24 * 60);
+	assert.equal(entry?.result.snapshot?.monthly?.resetsAt, now + 86_400_000);
 
 	// Verify credits
 	assert.equal(entry?.result.snapshot?.credits?.hasCredits, true);
