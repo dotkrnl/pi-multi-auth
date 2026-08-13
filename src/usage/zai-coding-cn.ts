@@ -13,14 +13,18 @@ const ZAI_CODING_CN_API_ORIGIN = "https://open.bigmodel.cn";
 const ZAI_CODING_CN_QUOTA_PATH = "/api/monitor/usage/quota/limit";
 const REQUEST_TIMEOUT_MS = 3_000;
 
-/** GLM coding-plan short request window (`type: "TIME_LIMIT"`) is 5 hours. */
-const TIME_LIMIT_WINDOW_MINUTES = 5 * 60;
-/** GLM coding-plan token budget (`type: "TOKENS_LIMIT"`) resets weekly. */
-const TOKENS_LIMIT_WINDOW_MINUTES = 7 * 24 * 60;
+/** GLM coding-plan model token/credit budget for the rolling 5-hour window. */
+const FIVE_HOUR_WINDOW_MINUTES = 5 * 60;
+/** GLM coding-plan model token/credit budget for the weekly window. */
+const WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
+
+type ZaiQuotaLimitType = "TIME_LIMIT" | "TOKENS_LIMIT";
 
 interface ZaiQuotaLimitRow {
+	type: ZaiQuotaLimitType;
+	unit: number | null;
+	number: number | null;
 	usedPercent: number;
-	windowMinutes: number | null;
 	resetsAt: number | null;
 }
 
@@ -98,19 +102,21 @@ function parseLimitRow(value: unknown): ZaiQuotaLimitRow | null {
 	}
 
 	return {
+		type,
+		unit: asNumber(value.unit),
+		number: asNumber(value.number),
 		usedPercent: clampPercent(usedPercent),
-		windowMinutes: type === "TIME_LIMIT" ? TIME_LIMIT_WINDOW_MINUTES : TOKENS_LIMIT_WINDOW_MINUTES,
 		resetsAt: parseResetAt(value.nextResetTime),
 	};
 }
 
-function parseQuotaLimits(payload: unknown): ZaiQuotaLimitRow[] {
+function parseQuotaLimits(payload: unknown): { rows: ZaiQuotaLimitRow[]; level: string | null } {
 	if (!isRecord(payload)) {
-		return [];
+		return { rows: [], level: null };
 	}
 	const data = isRecord(payload.data) ? payload.data : null;
 	if (!data || !Array.isArray(data.limits)) {
-		return [];
+		return { rows: [], level: null };
 	}
 	const rows: ZaiQuotaLimitRow[] = [];
 	for (const item of data.limits) {
@@ -119,16 +125,42 @@ function parseQuotaLimits(payload: unknown): ZaiQuotaLimitRow[] {
 			rows.push(row);
 		}
 	}
-	return rows;
+	return { rows, level: normalizeNonEmptyString(data.level) ?? null };
 }
 
-function toWindow(row: ZaiQuotaLimitRow | undefined): RateLimitWindow | null {
+/**
+ * Maps a `TOKENS_LIMIT` row to its window length. The GLM quota API encodes the
+ * window in the undocumented `unit`/`number` pair; the two buckets observed in
+ * practice (and used by other coding-plan quota tools) are `(3, 5)` for the
+ * rolling 5-hour budget and `(6, 1)` for the weekly budget. Unrecognized
+ * buckets fall back to the reset horizon when the row carries one.
+ */
+function resolveTokenWindowMinutes(row: ZaiQuotaLimitRow, now: number): number | null {
+	if (row.unit === 3 && row.number === 5) {
+		return FIVE_HOUR_WINDOW_MINUTES;
+	}
+	if (row.unit === 6 && row.number === 1) {
+		return WEEKLY_WINDOW_MINUTES;
+	}
+	if (row.resetsAt !== null) {
+		const spanMinutes = (row.resetsAt - now) / 60_000;
+		if (spanMinutes > 0 && spanMinutes <= 6 * 60) {
+			return FIVE_HOUR_WINDOW_MINUTES;
+		}
+		if (spanMinutes >= 5 * 24 * 60) {
+			return WEEKLY_WINDOW_MINUTES;
+		}
+	}
+	return null;
+}
+
+function toWindow(row: ZaiQuotaLimitRow | undefined, windowMinutes: number | null): RateLimitWindow | null {
 	if (!row) {
 		return null;
 	}
 	return {
 		usedPercent: row.usedPercent,
-		windowMinutes: row.windowMinutes,
+		windowMinutes,
 		resetsAt: row.resetsAt,
 	};
 }
@@ -148,11 +180,22 @@ function getEstimatedResetAt(primary: RateLimitWindow | null, secondary: RateLim
  * monitor endpoint `GET /api/monitor/usage/quota/limit` using the account's API
  * key as a Bearer token.
  *
- * The endpoint reports two limit buckets: a 5-hour request window
- * (`TIME_LIMIT`, with an explicit `nextResetTime`) and a weekly token budget
- * (`TOKENS_LIMIT`). Each entry carries a `percentage` of the budget already
- * consumed plus raw `usage`/`currentValue`/`remaining` counters, which we
- * normalize into the shared `RateLimitWindow` shape.
+ * The endpoint reports two kinds of limit buckets, distinguished by `type` and
+ * the `unit`/`number` pair:
+ *
+ * - `TOKENS_LIMIT` with `unit: 3, number: 5` — the model token/credit budget
+ *   for the rolling 5-hour window (primary window).
+ * - `TOKENS_LIMIT` with `unit: 6, number: 1` — the model token/credit budget
+ *   for the weekly window (secondary window, with an explicit `nextResetTime`).
+ * - `TIME_LIMIT` — the MCP tool pool (web-search / web-reader / zread, per the
+ *   row's `usageDetails` model codes). Coding traffic does not consume this
+ *   pool, so it is deliberately excluded from the reported quota windows;
+ *   surfacing it as the primary window would show a permanently-zero gauge.
+ *
+ * Each entry carries a `percentage` of the budget already consumed plus, when
+ * active, raw `usage`/`currentValue`/`remaining` counters, which we normalize
+ * into the shared `RateLimitWindow` shape. The account plan tier (`level`,
+ * e.g. "pro") is reported as the snapshot's plan type.
  */
 export const zaiCodingCnUsageProvider: UsageProvider<UsageAuth> = {
 	id: ZAI_CODING_CN_PROVIDER_ID,
@@ -194,24 +237,31 @@ export const zaiCodingCnUsageProvider: UsageProvider<UsageAuth> = {
 			throw new Error(message ? `Z.AI Coding CN quota request failed: ${message}` : "Z.AI Coding CN quota request failed");
 		}
 
-		const rows = parseQuotaLimits(payload);
-		if (rows.length === 0) {
+		const now = Date.now();
+		const { rows, level } = parseQuotaLimits(payload);
+		// Only TOKENS_LIMIT rows track model consumption. TIME_LIMIT rows are the
+		// MCP tool pool (web-search / web-reader / zread) and are excluded.
+		const tokenWindows = rows
+			.filter((row) => row.type === "TOKENS_LIMIT")
+			.map((row) => ({ row, windowMinutes: resolveTokenWindowMinutes(row, now) }))
+			.sort(
+				(left, right) =>
+					(left.windowMinutes ?? Number.MAX_SAFE_INTEGER) - (right.windowMinutes ?? Number.MAX_SAFE_INTEGER),
+			);
+		if (tokenWindows.length === 0) {
 			throw new Error("Z.AI Coding CN quota response format was invalid");
 		}
 
-		// Prefer the short request window as primary, matching other providers.
-		const sorted = [...rows].sort(
-			(left, right) => (left.windowMinutes ?? Number.MAX_SAFE_INTEGER) - (right.windowMinutes ?? Number.MAX_SAFE_INTEGER),
-		);
-		const primary = toWindow(sorted[0]);
-		const secondary = toWindow(sorted[1]);
+		// The short 5-hour budget is the primary window, the weekly budget the
+		// secondary window, matching other providers.
+		const primary = toWindow(tokenWindows[0]?.row, tokenWindows[0]?.windowMinutes ?? null);
+		const secondary = toWindow(tokenWindows[1]?.row, tokenWindows[1]?.windowMinutes ?? null);
 		const quotaClassification = quotaClassifier.classifyFromUsage(primary, secondary).classification;
 
-		const now = Date.now();
 		return {
 			timestamp: now,
 			provider: ZAI_CODING_CN_PROVIDER_ID,
-			planType: null,
+			planType: level,
 			primary,
 			secondary,
 			credits: null,

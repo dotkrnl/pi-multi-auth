@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Fixed
+- Z.AI Coding CN (GLM bigmodel.cn) quota windows were mapped to the wrong limit buckets. The monitor endpoint reports three buckets: a `TIME_LIMIT` row for the MCP tool pool (web-search / web-reader / zread) and two `TOKENS_LIMIT` rows keyed by `unit`/`number` — `(3, 5)` for the rolling 5-hour model token budget and `(6, 1)` for the weekly budget. Previously the MCP pool was shown as the 5-hour window (a gauge stuck at 0% for coding traffic) and the 5-hour token budget was mislabeled as the weekly window, while the real weekly budget was dropped entirely. The snapshot now reports the 5-hour token budget as the primary window and the weekly token budget as the secondary window, excludes the MCP pool, and surfaces the account plan tier (`level`) as the plan type.
+
 ## 0.12.0 - 2026-08-11
 
 ### Added
