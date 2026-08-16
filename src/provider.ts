@@ -6,7 +6,12 @@ import {
 	type Context,
 	createAssistantMessageEventStream,
 	type Model,
+	type OAuthAuth,
+	type OAuthCredentials,
+	type OAuthCredential,
+	type OAuthLoginCallbacks,
 	type Provider,
+	type ProviderAuthInteraction,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import {
@@ -21,6 +26,10 @@ import {
 	AccountManager,
 	createCredentialSelectionCache,
 } from "./account-manager.js";
+import {
+	getOAuthProvider,
+	type OAuthProviderInterface,
+} from "./oauth-compat.js";
 import { getErrorMessage, isAbortError } from "./auth-error-utils.js";
 import {
 	classifyCredentialError,
@@ -71,6 +80,47 @@ const providerRetryBudget = new RetryBudget({
 });
 
 type ApiProviderRef = NonNullable<ReturnType<typeof getApiProvider>>;
+
+function adaptOAuthProviderForProviderConfig(provider: OAuthProviderInterface) {
+	return {
+		name: provider.name,
+		usesCallbackServer: provider.usesCallbackServer,
+		login: async (callbacks: OAuthLoginCallbacks) => provider.login(callbacks),
+		refreshToken: async (credentials: OAuthCredentials, _signal: AbortSignal) =>
+			provider.refreshToken(credentials),
+		getApiKey: (credentials: OAuthCredentials) => provider.getApiKey(credentials),
+		modifyModels: provider.modifyModels
+			? (models: Model<Api>[], credentials: OAuthCredentials) =>
+					provider.modifyModels?.(models, credentials) ?? models
+			: undefined,
+	};
+}
+
+function adaptOAuthProviderForNativeAuth(provider: OAuthProviderInterface): OAuthAuth {
+	return {
+		name: provider.name,
+		login: async (interaction: ProviderAuthInteraction): Promise<OAuthCredential> => {
+			const credential = await provider.login({
+				onAuth: (info) => interaction.notify({ type: "auth_url", ...info }),
+				onDeviceCode: (info) => interaction.notify({ type: "device_code", ...info }),
+				onPrompt: (prompt) => interaction.prompt({ type: "text", ...prompt }),
+				onProgress: (message) => interaction.notify({ type: "progress", message }),
+				onManualCodeInput: () =>
+					interaction.prompt({ type: "manual_code", message: "Paste the authorization code" }),
+				onSelect: (prompt) => interaction.prompt({ type: "select", ...prompt }),
+				signal: interaction.signal,
+			});
+			return { ...credential, type: "oauth" };
+		},
+		refresh: async (credential: OAuthCredential, signal: AbortSignal): Promise<OAuthCredential> => ({
+			...(await provider.refreshToken(credential)),
+			type: "oauth",
+		}),
+		toAuth: async (credential: OAuthCredential) => ({
+			apiKey: provider.getApiKey(credential),
+		}),
+	};
+}
 
 type ProviderRegistrationMetricState = {
 	discoveryCount: number;
@@ -2065,6 +2115,9 @@ export async function registerMultiAuthProviders(
 			baseUrl: model.baseUrl ?? metadata.baseUrl,
 			provider: metadata.provider,
 		}));
+		const oauthProvider = getOAuthProvider(
+			metadata.provider as Parameters<typeof getOAuthProvider>[0],
+		);
 		const nativeProvider: Provider = {
 			id: metadata.provider,
 			name: metadata.provider,
@@ -2078,6 +2131,9 @@ export async function registerMultiAuthProviders(
 						source: "pi-multi-auth",
 					}),
 				},
+				...(oauthProvider
+					? { oauth: adaptOAuthProviderForNativeAuth(oauthProvider) }
+					: {}),
 			},
 			getModels: () => registeredModels,
 			stream: (model, context, options) => {
@@ -2096,5 +2152,16 @@ export async function registerMultiAuthProviders(
 			},
 		};
 		pi.registerProvider(nativeProvider);
+		// Keep the provider visible/selectable immediately after registration.
+		// Native providers are not added to the availability snapshot
+		// synchronously, so a thin config overlay also preserves OAuth when
+		// registerMultiAuthProviders runs at runtime (auth.json changes).
+		pi.registerProvider(metadata.provider, {
+			baseUrl: metadata.baseUrl,
+			apiKey: "managed-by-multi-auth",
+			...(oauthProvider
+				? { oauth: adaptOAuthProviderForProviderConfig(oauthProvider) }
+				: {}),
+		});
 	}
 }
