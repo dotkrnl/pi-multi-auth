@@ -583,7 +583,7 @@ function toEpochMs(timestamp: number | null | undefined): number | null {
 
 function inferQuotaStateFromUsageWindows(
 	snapshot: UsageSnapshot | null,
-	windows: readonly ("primary" | "secondary")[],
+	windows: readonly ("primary" | "secondary" | "monthly")[],
 ): UsageQuotaState {
 	if (!snapshot) {
 		return { state: "unknown" };
@@ -612,7 +612,13 @@ function inferQuotaStateFromUsageWindows(
 	};
 
 	for (const window of windows) {
-		considerWindow(window === "primary" ? snapshot.primary : snapshot.secondary);
+		considerWindow(
+			window === "primary"
+				? snapshot.primary
+				: window === "secondary"
+					? snapshot.secondary
+					: snapshot.monthly ?? null,
+		);
 	}
 
 	if (snapshot.copilotQuota) {
@@ -668,7 +674,7 @@ function inferQuotaStateFromUsageWindows(
 }
 
 function inferQuotaStateFromUsage(snapshot: UsageSnapshot | null): UsageQuotaState {
-	return inferQuotaStateFromUsageWindows(snapshot, ["primary", "secondary"]);
+	return inferQuotaStateFromUsageWindows(snapshot, ["primary", "secondary", "monthly"]);
 }
 
 function inferOperationalQuotaStateFromUsage(
@@ -690,7 +696,7 @@ function inferModelEligibilityQuotaStateFromUsage(
 	}
 	return inferQuotaStateFromUsageWindows(
 		snapshot,
-		requiresEntitlement ? ["primary", "secondary"] : ["primary"],
+		requiresEntitlement ? ["primary", "secondary", "monthly"] : ["primary"],
 	);
 }
 
@@ -720,13 +726,10 @@ function isUsageSnapshotUntouched(snapshot: UsageSnapshot | null): boolean {
 		});
 	}
 
-	const primaryUsed = snapshot.primary?.usedPercent;
-	const secondaryUsed = snapshot.secondary?.usedPercent;
-	if (typeof primaryUsed !== "number" || typeof secondaryUsed !== "number") {
-		return false;
-	}
-
-	return primaryUsed <= 0 && secondaryUsed <= 0;
+	const usageWindows = [snapshot.primary, snapshot.secondary, snapshot.monthly].filter(
+		(window): window is NonNullable<typeof window> => window !== null && window !== undefined,
+	);
+	return usageWindows.length > 0 && usageWindows.every((window) => window.usedPercent <= 0);
 }
 
 function getUsageSnapshotResetAt(snapshot: UsageSnapshot | null): number | null {
@@ -734,14 +737,11 @@ function getUsageSnapshotResetAt(snapshot: UsageSnapshot | null): number | null 
 		return null;
 	}
 
-	const secondaryResetAt = toEpochMs(snapshot.secondary?.resetsAt);
-	if (secondaryResetAt !== null) {
-		return secondaryResetAt;
-	}
-
-	const primaryResetAt = toEpochMs(snapshot.primary?.resetsAt);
-	if (primaryResetAt !== null) {
-		return primaryResetAt;
+	const windowResetAt = [snapshot.primary?.resetsAt, snapshot.secondary?.resetsAt, snapshot.monthly?.resetsAt]
+		.map((value) => toEpochMs(value))
+		.filter((value): value is number => value !== null);
+	if (windowResetAt.length > 0) {
+		return Math.min(...windowResetAt);
 	}
 
 	const rateLimitResetAt = toEpochMs(snapshot.estimatedResetAt ?? snapshot.rateLimitHeaders?.resetAt);
@@ -766,6 +766,7 @@ function getUsageSnapshotUsedPercent(snapshot: UsageSnapshot | null): number | n
 
 	appendPercentage(snapshot.primary?.usedPercent);
 	appendPercentage(snapshot.secondary?.usedPercent);
+	appendPercentage(snapshot.monthly?.usedPercent);
 
 	if (snapshot.copilotQuota) {
 		for (const bucket of [snapshot.copilotQuota.chat, snapshot.copilotQuota.completions]) {
@@ -821,7 +822,7 @@ function getSelectionUsageMaxAgeMs(provider: SupportedProviderId): number {
 
 function getUsageSnapshotWindowUsedPercent(
 	snapshot: UsageSnapshot | null,
-	window: "primary" | "secondary",
+	window: "primary" | "secondary" | "monthly",
 ): number | null {
 	const usedPercent = snapshot?.[window]?.usedPercent;
 	return typeof usedPercent === "number" && Number.isFinite(usedPercent)
@@ -4708,40 +4709,8 @@ export class AccountManager {
 
 		const manualCredentialId = pinnedCredentialId ? undefined : state.manualActiveCredentialId;
 		if (manualCredentialId) {
-			if (
-				modelEligibility.appliesConstraint &&
-				modelEligibility.ineligibleCredentialIds.includes(manualCredentialId) &&
-				requestedModelId !== undefined
-			) {
-				throw new Error(
-					`Manual active account '${manualCredentialId}' for ${provider} is not eligible for ${formatModelReference(provider, requestedModelId)}. Clear manual active selection in /multi-auth to let automatic rotation use an entitled account.`,
-				);
-			}
-			if (effectiveExcludedCredentialIds.has(manualCredentialId)) {
-				if (expiredApiKeyCredentialIds.has(manualCredentialId)) {
-					throw new Error(
-						`Manual active account '${manualCredentialId}' for ${provider} uses an expired WorkOS token. Re-authenticate the account or clear manual active selection in /multi-auth to let automatic rotation recover.`,
-					);
-				}
-				const disabledReason = getDisabledError(state, manualCredentialId);
-				if (disabledReason) {
-					throw new Error(
-						`Manual active account '${manualCredentialId}' for ${provider} is disabled due to a previous provider error. Clear manual active selection in /multi-auth to let automatic rotation recover.`,
-					);
-				}
-				const modelIncompatibility = getModelIncompatibility(state, provider, manualCredentialId, requestedModelId);
-				if (modelIncompatibility) {
-					throw new Error(
-						`Manual active account '${manualCredentialId}' for ${provider} is incompatible with ${formatModelReference(provider, requestedModelId ?? "requested model")} until ${new Date(modelIncompatibility.blockedUntil).toISOString()}. Clear manual active selection in /multi-auth to let automatic rotation recover.`,
-					);
-				}
-				throw new Error(
-					`Manual active account '${manualCredentialId}' for ${provider} is quota-limited for this request. Disable manual active selection in /multi-auth to let automatic rotation recover.`,
-				);
-			}
-
-			selectedIndex = state.credentialIds.indexOf(manualCredentialId);
-			if (selectedIndex < 0) {
+			const manualIndex = state.credentialIds.indexOf(manualCredentialId);
+			if (manualIndex < 0) {
 				await this.clearManualActiveCredential(provider);
 				state = await raceWithSignal(
 					this.syncProviderState(provider),
@@ -4751,11 +4720,21 @@ export class AccountManager {
 				selectedIndex = undefined;
 			} else {
 				const exhaustedUntil = state.quotaExhaustedUntil[manualCredentialId];
-				if (typeof exhaustedUntil === "number" && exhaustedUntil > Date.now()) {
+				if (expiredApiKeyCredentialIds.has(manualCredentialId)) {
 					throw new Error(
-						`Manual active account '${manualCredentialId}' for ${provider} is marked exhausted until ${new Date(exhaustedUntil).toISOString()}. Clear manual active selection in /multi-auth to let automatic rotation use other accounts.`,
+						`Manual active account '${manualCredentialId}' for ${provider} uses an expired WorkOS token. Re-authenticate the account or clear manual active selection to let automatic rotation recover.`,
 					);
 				}
+				const manualIsUnavailable =
+					effectiveExcludedCredentialIds.has(manualCredentialId) ||
+					(typeof exhaustedUntil === "number" && exhaustedUntil > Date.now());
+				if (!manualIsUnavailable) {
+					selectedIndex = manualIndex;
+				}
+				// A manual selection is a preference, not a reason to retry a known
+				// failed/quota-limited credential. This allows request-level retries
+				// and quota cooldowns to fail over while preserving the manual choice
+				// whenever it remains usable.
 			}
 		}
 
@@ -6113,6 +6092,7 @@ export class AccountManager {
 							usedPercent: null,
 							primaryUsedPercent: null,
 							secondaryUsedPercent: null,
+							monthlyUsedPercent: null,
 							resetAt: null,
 							quotaState: { state: "unknown" } as UsageQuotaState,
 						};
@@ -6126,6 +6106,7 @@ export class AccountManager {
 						usedPercent: getUsageSnapshotUsedPercent(snapshot),
 						primaryUsedPercent: getUsageSnapshotWindowUsedPercent(snapshot, "primary"),
 						secondaryUsedPercent: getUsageSnapshotWindowUsedPercent(snapshot, "secondary"),
+						monthlyUsedPercent: getUsageSnapshotWindowUsedPercent(snapshot, "monthly"),
 						resetAt: getUsageSnapshotResetAt(snapshot),
 						quotaState: inferOperationalQuotaStateFromUsage(provider, snapshot),
 					};
@@ -6155,6 +6136,13 @@ export class AccountManager {
 				);
 				if (secondaryUsageComparison !== 0) {
 					return secondaryUsageComparison;
+				}
+				const monthlyUsageComparison = compareNullableNumberAscending(
+					left.monthlyUsedPercent,
+					right.monthlyUsedPercent,
+				);
+				if (monthlyUsageComparison !== 0) {
+					return monthlyUsageComparison;
 				}
 				const primaryUsageComparison = compareNullableNumberAscending(
 					left.primaryUsedPercent,
@@ -6330,6 +6318,7 @@ export class AccountManager {
 			usedPercent: number | null;
 			primaryUsedPercent: number | null;
 			secondaryUsedPercent: number | null;
+			monthlyUsedPercent: number | null;
 			resetAt: number | null;
 		};
 
@@ -6356,6 +6345,7 @@ export class AccountManager {
 				usedPercent,
 				primaryUsedPercent: getUsageSnapshotWindowUsedPercent(snapshot, "primary"),
 				secondaryUsedPercent: getUsageSnapshotWindowUsedPercent(snapshot, "secondary"),
+				monthlyUsedPercent: getUsageSnapshotWindowUsedPercent(snapshot, "monthly"),
 				resetAt: getUsageSnapshotResetAt(snapshot),
 			};
 		};
@@ -6461,6 +6451,13 @@ export class AccountManager {
 				);
 				if (secondaryUsageComparison !== 0) {
 					return secondaryUsageComparison;
+				}
+				const monthlyUsageComparison = compareNullableNumberAscending(
+					left.monthlyUsedPercent,
+					right.monthlyUsedPercent,
+				);
+				if (monthlyUsageComparison !== 0) {
+					return monthlyUsageComparison;
 				}
 				const primaryUsageComparison = compareNullableNumberAscending(
 					left.primaryUsedPercent,
@@ -6600,6 +6597,7 @@ export class AccountManager {
 			snapshot?.primary ?? null,
 			snapshot?.secondary ?? null,
 			snapshot?.rateLimitHeaders,
+			snapshot?.monthly ?? null,
 		);
 		const didUpdateState = await this.storage.withLock((state) => {
 			const providerState = getProviderState(state, provider);

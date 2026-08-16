@@ -236,7 +236,7 @@ export const opencodeGoUsageProvider: UsageProvider<UsageAuth> = {
 
 		const balanceCents = extractBalanceCents(html);
 		const credits = buildUsageCredits(balanceCents);
-		const quotaClassification = quotaClassifier.classifyFromUsage(primary, secondary).classification;
+		const quotaClassification = quotaClassifier.classifyFromUsage(primary, secondary, undefined, monthly).classification;
 
 		return {
 			timestamp: now,

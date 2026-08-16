@@ -289,20 +289,25 @@ export class QuotaClassifier {
 		primary: RateLimitWindow | null,
 		secondary: RateLimitWindow | null,
 		headers?: ParsedRateLimitHeaders,
+		monthly?: RateLimitWindow | null,
 	): QuotaClassificationResult {
 		const headerResult = headers ? this.classifyFromHeaders(headers) : null;
 		if (headerResult && headerResult.classification !== "unknown") {
 			return headerResult;
 		}
 
-		const candidates = [secondary, primary]
-			.map((window) => inferClassificationFromWindow(window))
-			.filter((classification): classification is Exclude<QuotaClassification, "unknown"> =>
-				classification !== "unknown",
+		const candidates = [monthly ?? null, secondary, primary]
+			.map((window) => ({ window, classification: inferClassificationFromWindow(window) }))
+			.filter(
+				(entry): entry is {
+					window: RateLimitWindow;
+					classification: Exclude<QuotaClassification, "unknown">;
+				} => entry.classification !== "unknown" && entry.window !== null,
 			);
-		const hasClassification = candidates.length > 0;
-		const classification: QuotaClassification = hasClassification ? candidates[0] : "unknown";
-		const resetAt = secondary?.resetsAt ?? primary?.resetsAt ?? null;
+		const selected = candidates[0];
+		const hasClassification = selected !== undefined;
+		const classification: QuotaClassification = selected?.classification ?? "unknown";
+		const resetAt = selected?.window.resetsAt ?? null;
 		return {
 			classification,
 			window:

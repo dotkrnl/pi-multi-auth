@@ -6,6 +6,7 @@ import {
 	type Context,
 	createAssistantMessageEventStream,
 	type Model,
+	type Provider,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import {
@@ -2051,12 +2052,49 @@ export async function registerMultiAuthProviders(
 			lastRegistrationDeltaMs: registrationMetrics.lastRegistrationDeltaMs,
 		});
 
-		pi.registerProvider(metadata.provider, {
+		// Register a native provider rather than a config overlay. The newer Pi
+		// model runtime only dispatches a config overlay's streamSimple handler
+		// when model.api === config.api. OpenCode Go (and several other
+		// providers) expose models across multiple APIs, so a config overlay
+		// silently bypasses rotation for secondary APIs and calls the built-in
+		// provider directly. A native provider owns the complete mixed-API model
+		// set and dispatches every request through the appropriate wrapper.
+		const registeredModels: Model<Api>[] = metadata.models.map((model) => ({
+			...model,
+			api: model.api ?? primaryApi,
+			baseUrl: model.baseUrl ?? metadata.baseUrl,
+			provider: metadata.provider,
+		}));
+		const nativeProvider: Provider = {
+			id: metadata.provider,
+			name: metadata.provider,
 			baseUrl: metadata.baseUrl,
-			apiKey: "managed-by-multi-auth",
-			api: primaryApi,
-			models: metadata.models,
-			streamSimple: primaryWrapper,
-		});
+			auth: {
+				apiKey: {
+					name: "Managed by pi-multi-auth",
+					check: async () => ({ type: "api_key", source: "pi-multi-auth" }),
+					resolve: async () => ({
+						auth: { apiKey: "managed-by-multi-auth" },
+						source: "pi-multi-auth",
+					}),
+				},
+			},
+			getModels: () => registeredModels,
+			stream: (model, context, options) => {
+				const wrapper = wrappersByApi.get(model.api);
+				if (!wrapper) {
+					throw new Error(`No multi-auth wrapper registered for API '${model.api}'.`);
+				}
+				return wrapper(model, context, options as SimpleStreamOptions);
+			},
+			streamSimple: (model, context, options) => {
+				const wrapper = wrappersByApi.get(model.api);
+				if (!wrapper) {
+					throw new Error(`No multi-auth wrapper registered for API '${model.api}'.`);
+				}
+				return wrapper(model, context, options);
+			},
+		};
+		pi.registerProvider(nativeProvider);
 	}
 }

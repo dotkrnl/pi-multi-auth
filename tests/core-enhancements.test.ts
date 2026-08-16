@@ -2559,6 +2559,26 @@ test("account manager keeps the recovered round-robin credential active after re
 	assert.equal(storageData.providers[providerId]?.activeIndex, 1);
 });
 
+test("manual active credentials fail over when quota cooldown marks them unavailable", async (t) => {
+	const providerId = "manual-failover-provider";
+	const { accountManager } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[providerId]: { type: "api_key", key: "alpha" },
+			[`${providerId}-1`]: { type: "api_key", key: "beta" },
+		},
+	});
+
+	await accountManager.ensureInitialized();
+	await accountManager.switchActiveCredential(providerId, 0);
+	await accountManager.markQuotaExceeded(providerId, providerId, {
+		errorMessage: "rolling request quota exhausted",
+	});
+
+	const selected = await accountManager.acquireCredential(providerId);
+	assert.equal(selected.credentialId, `${providerId}-1`);
+});
+
 test("account manager validates batch deletion requests", async (t) => {
 	const providerId = "batch-delete-validation-provider";
 	const { accountManager } = await createAccountManagerHarness(t, {
@@ -3009,6 +3029,52 @@ test("pool manager stays opt-in and selects the highest-priority healthy pool", 
 	});
 	assert.equal(selection?.pool.poolId, "primary");
 	assert.deepEqual(selection?.availableCredentialIds, ["cred-b", "cred-a"]);
+});
+
+test("OpenCode Go usage rotation skips credentials exhausted in any quota window", async (t) => {
+	const providerId = "opencode-go";
+	const now = Date.now();
+	const usageByKey = new Map<string, UsageSnapshot>([
+		[
+			"account-one",
+			createUsageSnapshotForTest(providerId, "Go", {
+				// The rolling window is exhausted even though weekly usage is low.
+				primary: { usedPercent: 100, windowMinutes: 5 * 60, resetsAt: now + 60_000 },
+				secondary: { usedPercent: 1, windowMinutes: 7 * 24 * 60, resetsAt: now + 7 * 24 * 60 * 60_000 },
+				monthly: { usedPercent: 100, windowMinutes: 30 * 24 * 60, resetsAt: now + 30 * 24 * 60 * 60_000 },
+			}),
+		],
+		[
+			"account-two",
+			createUsageSnapshotForTest(providerId, "Go", {
+				primary: { usedPercent: 10, windowMinutes: 5 * 60, resetsAt: now + 60_000 },
+				secondary: { usedPercent: 5, windowMinutes: 7 * 24 * 60, resetsAt: now + 7 * 24 * 60 * 60_000 },
+				monthly: { usedPercent: 10, windowMinutes: 30 * 24 * 60, resetsAt: now + 30 * 24 * 60 * 60_000 },
+			}),
+		],
+	]);
+	const extensionConfig = cloneExtensionConfig();
+	extensionConfig.rotationModes[providerId] = "usage-based";
+	const { accountManager } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[providerId]: {
+				type: "api_key",
+				key: "account-one",
+				opencodeGo: { workspaceId: "wrk_one", cookie: "cookie-one" },
+			},
+			[`${providerId}-1`]: {
+				type: "api_key",
+				key: "account-two",
+				opencodeGo: { workspaceId: "wrk_two", cookie: "cookie-two" },
+			},
+		},
+		usageFetcher: async (auth) => usageByKey.get(auth.accessToken) ?? null,
+		extensionConfig,
+	});
+
+	const selected = await accountManager.acquireCredential(providerId);
+	assert.equal(selected.credentialId, `${providerId}-1`);
 });
 
 test("account manager honors configured pools before default rotation", async (t) => {
