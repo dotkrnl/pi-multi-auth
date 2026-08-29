@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, copyFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { userInfo } from "node:os";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
-import { sleep } from "./async-utils.js";
-import { getErrorMessage, toError } from "./auth-error-utils.js";
+import { abortableSleep } from "./async-utils.js";
+import { getErrorMessage, throwIfAborted, toError } from "./auth-error-utils.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
 import { isRetryableFileAccessError, readTextSnapshotWithRetries } from "./file-retry.js";
 
@@ -36,6 +37,12 @@ export type FileLockOptions = {
 	realpath?: boolean;
 	retries: LockRetryOptions;
 	stale: number;
+	/** Optional absolute acquisition timeout in addition to the retry limit. */
+	timeoutMs?: number;
+	/** Stops a caller that is waiting for the lock. */
+	signal?: AbortSignal;
+	/** Optional lock-directory mtime heartbeat for long-lived critical sections. */
+	update?: number;
 	onCompromised?: (error: Error) => void;
 };
 
@@ -264,8 +271,21 @@ export async function acquireFileLock(
 	observer: FileLockObserver = {},
 ): Promise<() => Promise<void>> {
 	const lockPath = lockDirPath(filePath);
+	const ownerPath = join(lockPath, ".owner");
+	const ownerToken = `${process.pid}:${randomUUID()}`;
 	const maxAttempts = Math.max(0, options.retries.retries) + 1;
+	const timeoutMs =
+		typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs)
+			? Math.max(0, options.timeoutMs)
+			: undefined;
+	const updateMs =
+		typeof options.update === "number" && Number.isFinite(options.update) && options.update > 0
+			? Math.max(1, Math.floor(options.update))
+			: undefined;
 	const startedAt = Date.now();
+	const abortMessage = `Lock acquisition aborted for '${filePath}'.`;
+
+	throwIfAborted(options.signal, abortMessage);
 
 	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
 		const details: FileLockAttemptDetails = {
@@ -277,12 +297,78 @@ export async function acquireFileLock(
 		};
 		try {
 			await mkdir(lockPath, { mode: 0o700 });
+			try {
+				await writeFile(ownerPath, ownerToken, { encoding: "utf-8", flag: "wx", mode: 0o600 });
+				throwIfAborted(options.signal, abortMessage);
+			} catch (setupError) {
+				await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+				throw setupError;
+			}
+
 			observer.onAcquired?.(Date.now() - startedAt, details);
+			let released = false;
+			let heartbeatPromise: Promise<void> | null = null;
+			let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+
+			const reportCompromised = (error: Error): void => {
+				if (released) {
+					return;
+				}
+				options.onCompromised?.(error);
+			};
+
+			if (updateMs !== undefined) {
+				heartbeatTimer = setInterval(() => {
+					if (released || heartbeatPromise) {
+						return;
+					}
+					heartbeatPromise = (async () => {
+						try {
+							const currentOwner = await readFile(ownerPath, "utf-8");
+							if (currentOwner !== ownerToken) {
+								throw new Error(`Lock ownership changed for '${lockPath}'.`);
+							}
+							const now = new Date();
+							await utimes(lockPath, now, now);
+						} catch (error) {
+							reportCompromised(toError(error));
+						}
+					})().finally(() => {
+						heartbeatPromise = null;
+					});
+					void heartbeatPromise;
+				}, updateMs);
+				heartbeatTimer.unref?.();
+			}
+
 			return async () => {
+				if (released) {
+					return;
+				}
+				released = true;
+				if (heartbeatTimer) {
+					clearInterval(heartbeatTimer);
+				}
+				await heartbeatPromise?.catch(() => undefined);
+
+				let currentOwner: string;
+				try {
+					currentOwner = await readFile(ownerPath, "utf-8");
+				} catch {
+					// A stale-lock recovery may already have replaced this lock.
+					return;
+				}
+				if (currentOwner !== ownerToken) {
+					// Never remove a replacement lock owned by another process.
+					return;
+				}
 				await rm(lockPath, { recursive: true, force: true });
 			};
 		} catch (error) {
 			const lockError = toError(error);
+			if (options.signal?.aborted) {
+				throwIfAborted(options.signal, abortMessage);
+			}
 			const maybeCode = (lockError as Error & { code?: unknown }).code;
 			const isExistingLockError = maybeCode === "EEXIST";
 			const isRetryableAccessError = isRetryableFileAccessError(lockError);
@@ -298,27 +384,35 @@ export async function acquireFileLock(
 
 			try {
 				const lockStats = await stat(lockPath);
-				const ageMs = Date.now() - lockStats.mtimeMs;
+				let ageMs = Date.now() - lockStats.mtimeMs;
 				if (ageMs > options.stale) {
-					await rm(lockPath, { recursive: true, force: true });
-					observer.onStaleLockRemoved?.({ ...details, ageMs: Math.round(ageMs) });
-					if (options.onCompromised) {
-						options.onCompromised(
+					// Confirm the age once more so a heartbeat racing the first stat wins.
+					const confirmedStats = await stat(lockPath);
+					ageMs = Date.now() - confirmedStats.mtimeMs;
+					if (ageMs > options.stale) {
+						await rm(lockPath, { recursive: true, force: true });
+						observer.onStaleLockRemoved?.({ ...details, ageMs: Math.round(ageMs) });
+						options.onCompromised?.(
 							new Error(`Removed stale lock '${lockPath}' older than ${Math.round(ageMs)}ms.`),
 						);
+						// Retry mkdir immediately after removing the stale lock.
+						attempt -= 1;
+						continue;
 					}
-					// Decrement attempt so we retry the mkdir immediately after removing stale lock.
-					attempt -= 1;
-					continue;
 				}
 			} catch {
 				// Lock may be released while checking staleness; retry.
 			}
 
-			if (attempt >= maxAttempts) {
+			const elapsedMs = Date.now() - startedAt;
+			const didTimeOut = timeoutMs !== undefined && elapsedMs >= timeoutMs;
+			if (attempt >= maxAttempts || didTimeOut) {
 				observer.onTimeout?.({ ...details, error: lockError.message });
+				const timeoutDescription = timeoutMs === undefined
+					? `${maxAttempts} attempt(s)`
+					: `${Math.round(elapsedMs)}ms`;
 				throw new Error(
-					`Timed out acquiring lock for '${filePath}' after ${maxAttempts} attempt(s): ${lockError.message}`,
+					`Timed out acquiring lock for '${filePath}' after ${timeoutDescription}: ${lockError.message}`,
 				);
 			}
 
@@ -329,11 +423,27 @@ export async function acquireFileLock(
 					Math.round(options.retries.minTimeout * Math.pow(options.retries.factor, attempt - 1)),
 				),
 			);
-			const delay = options.retries.randomize
+			let delay = options.retries.randomize
 				? Math.round(baseDelay * (0.5 + Math.random()))
 				: baseDelay;
+			if (timeoutMs !== undefined) {
+				delay = Math.min(delay, Math.max(0, timeoutMs - elapsedMs));
+			}
+			if (delay <= 0) {
+				observer.onTimeout?.({ ...details, error: lockError.message });
+				throw new Error(
+					`Timed out acquiring lock for '${filePath}' after ${Math.round(elapsedMs)}ms: ${lockError.message}`,
+				);
+			}
 			observer.onRetry?.(delay, { ...details, delayMs: delay, error: lockError.message });
-			await sleep(delay);
+			try {
+				await abortableSleep(delay, options.signal);
+			} catch (sleepError) {
+				if (options.signal?.aborted) {
+					throwIfAborted(options.signal, abortMessage);
+				}
+				throw sleepError;
+			}
 		}
 	}
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -2036,4 +2036,481 @@ test("usage cache rejects snapshots with malformed copilot quota bucket fields",
 			"Display entry with malformed copilot quota should be rejected",
 		);
 	}
+});
+
+test("usage refresh is single-flight across service instances and waiters consume the winner", async (t) => {
+	const { tempRoot, cachePath } = await createTempUsageCachePath();
+	t.after(async () => {
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+	});
+
+	const storeOptions = {
+		filePath: cachePath,
+		lockPollMs: 2,
+		refreshLockStaleMs: 1_000,
+		refreshLockWaitMs: 2_000,
+		refreshLockHeartbeatMs: 25,
+	};
+	const firstService = new UsageService(30_000, 300_000, 10_000, undefined, {
+		persistentCache: new UsageSnapshotCacheStore(storeOptions),
+	});
+	const secondService = new UsageService(30_000, 300_000, 10_000, undefined, {
+		persistentCache: new UsageSnapshotCacheStore(storeOptions),
+	});
+	const providerId = "cross-process-single-flight";
+	const credentialId = "credential-a";
+	const snapshot = { ...createUsageSnapshot(providerId), planType: "shared-winner" };
+	let fetchCount = 0;
+	let releaseFetch!: () => void;
+	const fetchGate = new Promise<void>((resolve) => {
+		releaseFetch = resolve;
+	});
+	let markFetchStarted!: () => void;
+	const fetchStarted = new Promise<void>((resolve) => {
+		markFetchStarted = resolve;
+	});
+	const provider = {
+		id: providerId,
+		displayName: providerId,
+		fetchUsage: async (_auth: UsageAuth) => {
+			fetchCount += 1;
+			markFetchStarted();
+			await fetchGate;
+			return snapshot;
+		},
+	};
+	firstService.register(provider);
+	secondService.register(provider);
+	await Promise.all([firstService.hydratePersistedCache(), secondService.hydratePersistedCache()]);
+
+	const firstRequest = firstService.fetchUsage(
+		providerId,
+		credentialId,
+		{ accessToken: "shared-token" },
+		{ forceRefresh: true },
+	);
+	await fetchStarted;
+	const secondRequest = secondService.fetchUsage(
+		providerId,
+		credentialId,
+		{ accessToken: "shared-token" },
+		{ forceRefresh: true },
+	);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	releaseFetch();
+
+	const [first, second] = await Promise.all([firstRequest, secondRequest]);
+	assert.equal(fetchCount, 1);
+	assert.equal(first.fromCache, false);
+	assert.equal(second.fromCache, true);
+	assert.deepEqual(first.snapshot, snapshot);
+	assert.deepEqual(second.snapshot, snapshot);
+});
+
+test("usage refreshes remain serialized across OAuth cache-key rotation", async (t) => {
+	const { tempRoot, cachePath } = await createTempUsageCachePath();
+	t.after(async () => {
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+	});
+
+	const storeOptions = {
+		filePath: cachePath,
+		lockPollMs: 2,
+		refreshLockStaleMs: 1_000,
+		refreshLockWaitMs: 2_000,
+		refreshLockHeartbeatMs: 25,
+	};
+	const firstService = new UsageService(30_000, 300_000, 10_000, undefined, {
+		persistentCache: new UsageSnapshotCacheStore(storeOptions),
+	});
+	const secondService = new UsageService(30_000, 300_000, 10_000, undefined, {
+		persistentCache: new UsageSnapshotCacheStore(storeOptions),
+	});
+	const providerId = "cross-process-rotated-usage-key";
+	const credentialId = "credential-a";
+	let fetchCount = 0;
+	let activeFetches = 0;
+	let maxActiveFetches = 0;
+	let releaseFirst!: () => void;
+	const firstGate = new Promise<void>((resolve) => {
+		releaseFirst = resolve;
+	});
+	let markFirstStarted!: () => void;
+	const firstStarted = new Promise<void>((resolve) => {
+		markFirstStarted = resolve;
+	});
+	const provider = {
+		id: providerId,
+		displayName: providerId,
+		fetchUsage: async (auth: UsageAuth) => {
+			fetchCount += 1;
+			activeFetches += 1;
+			maxActiveFetches = Math.max(maxActiveFetches, activeFetches);
+			try {
+				if (fetchCount === 1) {
+					markFirstStarted();
+					await firstGate;
+				}
+				return {
+					...createUsageSnapshot(providerId),
+					planType: auth.accessToken,
+				};
+			} finally {
+				activeFetches -= 1;
+			}
+		},
+	};
+	firstService.register(provider);
+	secondService.register(provider);
+	await Promise.all([firstService.hydratePersistedCache(), secondService.hydratePersistedCache()]);
+
+	const firstRequest = firstService.fetchUsage(
+		providerId,
+		credentialId,
+		{ accessToken: "old-access-token" },
+		{ forceRefresh: true },
+	);
+	await firstStarted;
+	const secondRequest = secondService.fetchUsage(
+		providerId,
+		credentialId,
+		{ accessToken: "new-access-token" },
+		{ forceRefresh: true },
+	);
+	releaseFirst();
+	const [first, second] = await Promise.all([firstRequest, secondRequest]);
+
+	assert.equal(fetchCount, 2, "different credential material needs its own snapshot");
+	assert.equal(maxActiveFetches, 1, "the credential slot must have only one external usage request at a time");
+	assert.equal(first.snapshot?.planType, "old-access-token");
+	assert.equal(second.snapshot?.planType, "new-access-token");
+});
+
+test("cross-process usage waiters consume a winner's negative cache entry", async (t) => {
+	const { tempRoot, cachePath } = await createTempUsageCachePath();
+	t.after(async () => {
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+	});
+
+	const storeOptions = {
+		filePath: cachePath,
+		lockPollMs: 2,
+		refreshLockStaleMs: 1_000,
+		refreshLockWaitMs: 2_000,
+		refreshLockHeartbeatMs: 25,
+	};
+	const firstService = new UsageService(30_000, 300_000, 10_000, undefined, {
+		persistentCache: new UsageSnapshotCacheStore(storeOptions),
+	});
+	const secondService = new UsageService(30_000, 300_000, 10_000, undefined, {
+		persistentCache: new UsageSnapshotCacheStore(storeOptions),
+	});
+	const providerId = "cross-process-negative";
+	let fetchCount = 0;
+	let releaseFetch!: () => void;
+	const fetchGate = new Promise<void>((resolve) => {
+		releaseFetch = resolve;
+	});
+	let markFetchStarted!: () => void;
+	const fetchStarted = new Promise<void>((resolve) => {
+		markFetchStarted = resolve;
+	});
+	const provider = {
+		id: providerId,
+		displayName: providerId,
+		fetchUsage: async (_auth: UsageAuth): Promise<UsageSnapshot | null> => {
+			fetchCount += 1;
+			markFetchStarted();
+			await fetchGate;
+			throw new Error("deterministic upstream failure");
+		},
+	};
+	firstService.register(provider);
+	secondService.register(provider);
+	await Promise.all([firstService.hydratePersistedCache(), secondService.hydratePersistedCache()]);
+
+	const firstRequest = firstService.fetchUsage(
+		providerId,
+		"credential-a",
+		{ accessToken: "shared-token" },
+		{ forceRefresh: true },
+	);
+	await fetchStarted;
+	const secondRequest = secondService.fetchUsage(
+		providerId,
+		"credential-a",
+		{ accessToken: "shared-token" },
+		{ forceRefresh: true },
+	);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	releaseFetch();
+
+	const [first, second] = await Promise.all([firstRequest, secondRequest]);
+	assert.equal(fetchCount, 1);
+	assert.match(first.error ?? "", /deterministic upstream failure/);
+	assert.equal(second.error, first.error);
+	assert.equal(second.fromCache, true);
+});
+
+test("concurrent cache writers merge credentials and running services observe disk updates", async (t) => {
+	const { tempRoot, cachePath } = await createTempUsageCachePath();
+	t.after(async () => {
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+	});
+
+	const storeOptions = { filePath: cachePath, lockPollMs: 2 };
+	const firstService = new UsageService(30_000, 300_000, 10_000, undefined, {
+		persistentCache: new UsageSnapshotCacheStore(storeOptions),
+	});
+	const secondService = new UsageService(30_000, 300_000, 10_000, undefined, {
+		persistentCache: new UsageSnapshotCacheStore(storeOptions),
+	});
+	const providerId = "openai-codex";
+	const firstSnapshot = { ...createUsageSnapshot(providerId), planType: "first" };
+	const secondSnapshot = { ...createUsageSnapshot(providerId), planType: "second" };
+	firstService.register({
+		id: providerId,
+		displayName: providerId,
+		fetchUsage: async () => firstSnapshot,
+	});
+	secondService.register({
+		id: providerId,
+		displayName: providerId,
+		fetchUsage: async () => secondSnapshot,
+	});
+	await Promise.all([firstService.hydratePersistedCache(), secondService.hydratePersistedCache()]);
+
+	await Promise.all([
+		firstService.fetchUsage(providerId, "credential-a", { accessToken: "token-a" }, { forceRefresh: true }),
+		secondService.fetchUsage(providerId, "credential-b", { accessToken: "token-b" }, { forceRefresh: true }),
+	]);
+
+	const persisted = await readPersistedCache(cachePath);
+	assert.deepEqual(
+		persisted.entries.map((entry) => entry.credentialId).sort(),
+		["credential-a", "credential-b"],
+	);
+	// No restart or explicit re-hydration: readCachedUsage performs a cheap
+	// fingerprint check and merges the other process's newer snapshot.
+	assert.equal(
+		firstService.readCachedUsage(providerId, "credential-b")?.snapshot?.planType,
+		"second",
+	);
+	assert.equal(
+		secondService.readCachedUsage(providerId, "credential-a")?.snapshot?.planType,
+		"first",
+	);
+
+	await firstService.harvestRateLimitHeaders(
+		providerId,
+		"credential-a",
+		createUsageCredentialCacheKey(providerId, "credential-a", { accessToken: "token-a" }),
+		{
+			"x-ratelimit-limit-requests": "100",
+			"x-ratelimit-remaining-requests": "0",
+			"x-ratelimit-reset-requests": "60",
+		},
+	);
+	assert.equal(
+		secondService.readCachedUsage(providerId, "credential-a")?.snapshot?.rateLimitHeaders?.remaining,
+		0,
+	);
+});
+
+test("live cache propagation follows OAuth credential-key rotation after initial hydration", async (t) => {
+	const { tempRoot, cachePath } = await createTempUsageCachePath();
+	t.after(async () => {
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+	});
+
+	const providerId = "rotated-usage-token-provider";
+	const credentialId = "credential-a";
+	const oldAuth = { accessToken: "old-access-token" };
+	const newAuth = { accessToken: "new-access-token" };
+	const oldCacheKey = createUsageCredentialCacheKey(providerId, credentialId, oldAuth);
+	const newCacheKey = createUsageCredentialCacheKey(providerId, credentialId, newAuth);
+	const createService = () => new UsageService(30_000, 300_000, 10_000, undefined, {
+		persistentCache: new UsageSnapshotCacheStore({ filePath: cachePath, lockPollMs: 2 }),
+	});
+	const writerService = createService();
+	const observerService = createService();
+	for (const service of [writerService, observerService]) {
+		service.setPreferredCredentialCacheKey(providerId, credentialId, oldCacheKey);
+		await service.hydratePersistedCache({
+			isCredentialValid: (_provider, _credential, cacheKey) => cacheKey === oldCacheKey,
+			isDisplayCredentialValid: () => true,
+			pruneInvalidEntries: true,
+		});
+		service.setPreferredCredentialCacheKey(providerId, credentialId, newCacheKey);
+	}
+
+	const snapshot = { ...createUsageSnapshot(providerId), planType: "rotated-token-snapshot" };
+	writerService.register({
+		id: providerId,
+		displayName: providerId,
+		fetchUsage: async () => snapshot,
+	});
+	await writerService.fetchUsage(providerId, credentialId, newAuth, { forceRefresh: true });
+
+	assert.equal(
+		observerService.readCachedUsage(providerId, credentialId)?.snapshot?.planType,
+		"rotated-token-snapshot",
+	);
+});
+
+test("usage refresh coordination recovers stale locks and times out without duplicate fetching", async (t) => {
+	const { tempRoot, cachePath } = await createTempUsageCachePath();
+	t.after(async () => {
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+	});
+
+	const providerId = "cross-process-lock-recovery";
+	const credentialId = "credential-a";
+	const auth = { accessToken: "shared-token" };
+	const staleStore = new UsageSnapshotCacheStore({
+		filePath: cachePath,
+		lockPollMs: 2,
+		refreshLockStaleMs: 20,
+		refreshLockWaitMs: 250,
+		refreshLockHeartbeatMs: 5,
+	});
+	const staleLockPath = staleStore.getCredentialRefreshLockPath(
+		providerId,
+		credentialId,
+		createUsageCredentialCacheKey(providerId, credentialId, auth),
+	);
+	await mkdir(staleLockPath, { recursive: true });
+	const staleDate = new Date(Date.now() - 1_000);
+	await utimes(staleLockPath, staleDate, staleDate);
+
+	let staleRecoveryFetchCount = 0;
+	const staleRecoveryService = new UsageService(30_000, 300_000, 10_000, undefined, {
+		persistentCache: staleStore,
+	});
+	staleRecoveryService.register({
+		id: providerId,
+		displayName: providerId,
+		fetchUsage: async () => {
+			staleRecoveryFetchCount += 1;
+			return createUsageSnapshot(providerId);
+		},
+	});
+	const recovered = await staleRecoveryService.fetchUsage(
+		providerId,
+		credentialId,
+		auth,
+		{ forceRefresh: true },
+	);
+	assert.equal(recovered.error, null);
+	assert.equal(staleRecoveryFetchCount, 1);
+
+	const timeoutPath = join(tempRoot, "timeout-usage-cache.json");
+	const ownerService = new UsageService(30_000, 300_000, 10_000, undefined, {
+		persistentCache: new UsageSnapshotCacheStore({
+			filePath: timeoutPath,
+			lockPollMs: 2,
+			refreshLockStaleMs: 1_000,
+			refreshLockWaitMs: 500,
+			refreshLockHeartbeatMs: 10,
+		}),
+	});
+	const waiterService = new UsageService(30_000, 300_000, 10_000, undefined, {
+		persistentCache: new UsageSnapshotCacheStore({
+			filePath: timeoutPath,
+			lockPollMs: 2,
+			refreshLockStaleMs: 1_000,
+			refreshLockWaitMs: 30,
+			refreshLockHeartbeatMs: 10,
+		}),
+	});
+	let timeoutFetchCount = 0;
+	let releaseOwner!: () => void;
+	const ownerGate = new Promise<void>((resolve) => {
+		releaseOwner = resolve;
+	});
+	let markOwnerStarted!: () => void;
+	const ownerStarted = new Promise<void>((resolve) => {
+		markOwnerStarted = resolve;
+	});
+	const blockedProvider = {
+		id: providerId,
+		displayName: providerId,
+		fetchUsage: async () => {
+			timeoutFetchCount += 1;
+			markOwnerStarted();
+			await ownerGate;
+			return createUsageSnapshot(providerId);
+		},
+	};
+	ownerService.register(blockedProvider);
+	waiterService.register(blockedProvider);
+	const ownerRequest = ownerService.fetchUsage(providerId, credentialId, auth, { forceRefresh: true });
+	await ownerStarted;
+	const timedOut = await waiterService.fetchUsage(providerId, credentialId, auth, { forceRefresh: true });
+	releaseOwner();
+	await ownerRequest;
+
+	assert.match(timedOut.error ?? "", /timed out waiting for another process/);
+	assert.equal(timeoutFetchCount, 1, "the timed-out waiter must not issue a duplicate external request");
+});
+
+test("locked cache updates refuse to clobber an unreadable existing snapshot", async (t) => {
+	const { tempRoot, cachePath } = await createTempUsageCachePath();
+	t.after(async () => {
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+	});
+
+	const malformed = "{ existing cache is malformed";
+	await writeFile(cachePath, malformed, "utf-8");
+	const store = new UsageSnapshotCacheStore({ filePath: cachePath, lockPollMs: 2 });
+	await assert.rejects(
+		store.persistSuccessfulEntry(createUsageCacheRecord("safe-merge-provider", "credential-a", Date.now())),
+		/not safe to merge/,
+	);
+	assert.equal(await readFile(cachePath, "utf-8"), malformed);
+});
+
+test("usage cache reads pre-extension schema-v3 snapshots without losing operational or display data", async (t) => {
+	const { tempRoot, cachePath } = await createTempUsageCachePath();
+	t.after(async () => {
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+	});
+
+	const now = Date.now();
+	const providerId = "schema-v3-provider";
+	const credentialId = "credential-a";
+	const credentialCacheKey = "cache:credential-a";
+	const snapshot = createUsageSnapshot(providerId, now);
+	await writeFile(cachePath, `${JSON.stringify({
+		schemaVersion: 3,
+		generatedAt: now,
+		maxEntries: 10,
+		maxDisplayEntries: 10,
+		displayRetentionMs: 86_400_000,
+		entries: [{
+			provider: providerId,
+			credentialId,
+			credentialCacheKey,
+			fetchedAt: now,
+			freshUntil: now + 30_000,
+			staleUntil: now + 300_000,
+			snapshot,
+		}],
+		displayEntries: [{
+			provider: providerId,
+			credentialId,
+			credentialCacheKey,
+			fetchedAt: now,
+			displayUntil: now + 86_400_000,
+		}],
+	}, null, 2)}\n`, "utf-8");
+
+	const store = new UsageSnapshotCacheStore({ filePath: cachePath, maxEntries: 10 });
+	const hydrated = await store.readHydrationEntries(now, { pruneInvalidEntries: true });
+	const rewritten = await readPersistedCache(cachePath);
+	assert.equal(rewritten.schemaVersion, USAGE_CACHE_SCHEMA_VERSION);
+	assert.deepEqual(hydrated.operationalEntries[0]?.result.snapshot, snapshot);
+	assert.deepEqual(hydrated.displayEntries[0]?.result.snapshot, snapshot);
+	assert.equal(rewritten.entries.length, 1);
+	assert.equal(rewritten.displayEntries?.length, 1);
 });

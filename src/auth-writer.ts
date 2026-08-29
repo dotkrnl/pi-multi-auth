@@ -40,6 +40,21 @@ export interface AuthCredentialEntry {
 	credential: StoredAuthCredential;
 }
 
+export type ConditionalOAuthCredentialWriteResult =
+	| { status: "updated"; credential: StoredOAuthCredential }
+	| { status: "changed"; credential?: StoredOAuthCredential };
+
+export function haveSameOAuthCredentialTokenVersion(
+	left: OAuthCredentials,
+	right: OAuthCredentials,
+): boolean {
+	return (
+		left.access === right.access &&
+		left.refresh === right.refresh &&
+		left.expires === right.expires
+	);
+}
+
 export interface ApiKeyProviderNormalizationResult {
 	provider: SupportedProviderId;
 	removedDuplicateCount: number;
@@ -346,6 +361,61 @@ export class AuthWriter {
 				...credential,
 			};
 			return { result: undefined, next };
+		});
+	}
+
+
+	/**
+	 * Persists refreshed token material only if the credential still has the
+	 * token version used for the network request. This prevents a refresh from
+	 * overwriting a login or another process's completed rotation.
+	 */
+	async setOAuthCredentialIfUnchanged(
+		credentialId: string,
+		expected: StoredOAuthCredential,
+		refreshed: OAuthCredentials,
+	): Promise<ConditionalOAuthCredentialWriteResult> {
+		return this.withLock<ConditionalOAuthCredentialWriteResult>((data) => {
+			const existing = data[credentialId];
+			if (!isOAuthCredential(existing)) {
+				return { result: { status: "changed" } };
+			}
+			if (!haveSameOAuthCredentialTokenVersion(existing, expected)) {
+				return {
+					result: {
+						status: "changed",
+						credential: cloneStoredCredential(existing) as StoredOAuthCredential,
+					},
+				};
+			}
+
+			const nextCredential: StoredOAuthCredential = {
+				...existing,
+				...refreshed,
+				type: "oauth",
+			};
+			// Request-only storage fields are authoritative in the locked snapshot;
+			// a provider refresh result must not revert a concurrent local edit.
+			if (existing.request === undefined) {
+				delete nextCredential.request;
+			} else {
+				nextCredential.request = existing.request;
+			}
+			if (existing.opencodeGo === undefined) {
+				delete nextCredential.opencodeGo;
+			} else {
+				nextCredential.opencodeGo = existing.opencodeGo;
+			}
+
+			const next = cloneAuthData(data);
+			next[credentialId] = nextCredential;
+			return {
+				result: {
+					status: "updated",
+					credential: cloneStoredCredential(nextCredential) as StoredOAuthCredential,
+				},
+				next,
+			};
 		});
 	}
 

@@ -30,6 +30,7 @@ import {
 	determineTokenExpiration,
 	OAuthRefreshScheduler,
 } from "./oauth-refresh-scheduler.js";
+import { acquireOAuthRefreshLock } from "./oauth-refresh-lock.js";
 import { PoolManager } from "./pool-manager.js";
 import { cloneProviderState } from "./provider-state-utils.js";
 import { resolveDefaultRotationMode } from "./rotation-modes.js";
@@ -43,6 +44,7 @@ import {
 } from "./rotation-selection.js";
 import {
 	AuthWriter,
+	haveSameOAuthCredentialTokenVersion,
 	type ApiKeyProviderNormalizationResult,
 	type AuthCredentialEntry,
 	type CredentialIdentityKeyResolver,
@@ -219,6 +221,20 @@ export type CredentialRefreshDisposition =
 export interface CredentialRefreshResult {
 	credential: StoredOAuthCredential;
 	disposition: CredentialRefreshDisposition;
+}
+
+interface OAuthCredentialRefreshOutcome {
+	credential: StoredOAuthCredential;
+	reusedCurrentCredential: boolean;
+}
+
+interface OAuthCredentialRefreshOptions {
+	allowDisabled?: boolean;
+}
+
+interface OAuthRefreshFailureHandlingResult {
+	failure: OAuthRefreshFailureError;
+	recoveredCredential?: StoredOAuthCredential;
 }
 
 export type CloudflareCredentialIdentityRefreshStatus = "updated" | "unchanged" | "unsupported";
@@ -1953,7 +1969,7 @@ export class AccountManager {
 	private readonly oauthRefreshScheduler: OAuthRefreshScheduler;
 	private readonly runtimeOptions: Readonly<Required<AccountManagerRuntimeOptions>>;
 	private readonly configPath: string;
-	private readonly oauthRefreshInFlight = new Map<string, Promise<StoredOAuthCredential>>();
+	private readonly oauthRefreshInFlight = new Map<string, Promise<OAuthCredentialRefreshOutcome>>();
 	private readonly processLeaseOwnerId: string;
 	private readonly lightweightRotationState: LightweightRotationState;
 	private readonly authWriter: AuthWriter;
@@ -2600,7 +2616,7 @@ export class AccountManager {
 	): Promise<void> {
 		this.registerCurrentUsageCredentialCacheKey(provider, credentialId, credential);
 		const credentialCacheKey = this.computeCurrentUsageCredentialCacheKey(provider, credentialId, credential);
-		const harvested = this.usageService.harvestRateLimitHeaders(
+		const harvested = await this.usageService.harvestRateLimitHeaders(
 			provider,
 			credentialId,
 			credentialCacheKey,
@@ -3031,12 +3047,13 @@ export class AccountManager {
 					message: usage.error,
 				});
 				try {
-					const forceRefreshed = await this.refreshCredentialToken(
+					const forceRefreshOutcome = await this.refreshCredentialToken(
 						provider,
 						credentialId,
 						freshCredential,
 						context?.signal ?? options?.signal,
 					);
+					const forceRefreshed = forceRefreshOutcome.credential;
 					this.registerCurrentUsageCredentialCacheKey(
 						provider,
 						credentialId,
@@ -3819,43 +3836,80 @@ export class AccountManager {
 		});
 	}
 
-	private async tryRecoverConcurrentCodexRefresh(
+	private async clearGenericConcurrentOAuthRefreshDisableState(
+		provider: SupportedProviderId,
+		credentialId: string,
+	): Promise<void> {
+		if (provider === "openai-codex" || provider === "cline") {
+			return;
+		}
+
+		await this.storage.withLock((state) => {
+			const providerState = getProviderState(state, provider);
+			const disabled = providerState.disabledCredentials?.[credentialId];
+			if (!disabled || !/failed to refresh oauth token/i.test(disabled.error)) {
+				return { result: false };
+			}
+			delete providerState.disabledCredentials[credentialId];
+			if (Object.keys(providerState.disabledCredentials).length === 0) {
+				providerState.disabledCredentials = {};
+			}
+			normalizeProviderState(providerState, provider);
+			return { result: true, next: state };
+		});
+	}
+
+	private async getDisabledOAuthRefreshFailure(
+		provider: SupportedProviderId,
+		credentialId: string,
+	): Promise<OAuthRefreshFailureError | null> {
+		const state = await this.storage.readProviderState(provider);
+		const disabled = getDisabledError(state, credentialId);
+		if (!disabled) {
+			return null;
+		}
+		return new OAuthRefreshFailureError(
+			`OAuth refresh skipped for ${credentialId} because the credential is disabled: ${disabled.error}`,
+			{
+				providerId: provider,
+				credentialId,
+				reason: "credential_disabled",
+				permanent: true,
+				source: "extension",
+			},
+		);
+	}
+
+	private async tryRecoverConcurrentOAuthRefresh(
 		provider: SupportedProviderId,
 		credentialId: string,
 		credential: StoredOAuthCredential,
 		error: unknown,
+		phase: "after_lock" | "after_failure" | "before_persist",
+		knownCurrentCredential?: StoredOAuthCredential,
 	): Promise<StoredOAuthCredential | null> {
-		if (provider !== "openai-codex" || !isOAuthRefreshFailureError(error)) {
-			return null;
-		}
-
-		const isRefreshTokenReuseFailure =
-			error.details.errorCode === "refresh_token_reused" ||
-			/already been used to generate a new access token/i.test(error.message);
-		if (!isRefreshTokenReuseFailure) {
-			return null;
-		}
-
-		const currentCredential = await this.authWriter.getCredential(credentialId);
-		if (!currentCredential || currentCredential.type !== "oauth") {
+		const currentCredential =
+			knownCurrentCredential ?? (await this.authWriter.getOAuthCredential(credentialId));
+		if (
+			!currentCredential ||
+			haveSameOAuthCredentialTokenVersion(currentCredential, credential)
+		) {
 			return null;
 		}
 
 		const hasRotatedRefreshToken = currentCredential.refresh !== credential.refresh;
 		const hasRotatedAccessToken = currentCredential.access !== credential.access;
-		const hasNewerExpiry = currentCredential.expires > credential.expires;
-		if (!hasRotatedRefreshToken && !hasRotatedAccessToken && !hasNewerExpiry) {
-			return null;
-		}
-
+		const hasChangedExpiry = currentCredential.expires !== credential.expires;
 		await this.clearRecoveredOAuthRefreshFailureState(provider, credentialId, currentCredential);
-		multiAuthDebugLogger.log("oauth_refresh_reuse_recovered", {
+		await this.clearGenericConcurrentOAuthRefreshDisableState(provider, credentialId);
+		multiAuthDebugLogger.log("oauth_refresh_concurrent_rotation_reused", {
 			provider,
 			credentialRef: redactUsageCredentialIdentifier(credentialId),
-			errorCode: error.details.errorCode,
+			phase,
+			errorCode: isOAuthRefreshFailureError(error) ? error.details.errorCode : undefined,
 			hasRotatedRefreshToken,
 			hasRotatedAccessToken,
-			hasNewerExpiry,
+			hasChangedExpiry,
 		});
 		return currentCredential;
 	}
@@ -3865,7 +3919,7 @@ export class AccountManager {
 		credentialId: string,
 		credential: StoredOAuthCredential,
 		error: unknown,
-	): Promise<OAuthRefreshFailureError> {
+	): Promise<OAuthRefreshFailureHandlingResult> {
 		const failure = this.createOAuthRefreshFailure(provider, credentialId, error);
 		multiAuthDebugLogger.log("oauth_refresh_failed", {
 			provider,
@@ -3878,6 +3932,17 @@ export class AccountManager {
 			reason: failure.details.reason,
 		});
 
+		const recoveredCredential = await this.tryRecoverConcurrentOAuthRefresh(
+			provider,
+			credentialId,
+			credential,
+			failure,
+			"after_failure",
+		);
+		if (recoveredCredential) {
+			return { failure, recoveredCredential };
+		}
+
 		if (failure.details.errorCode === UNSUPPORTED_OAUTH_REFRESH_PROVIDER_ERROR_CODE) {
 			this.oauthRefreshScheduler.cancelRefresh(credentialId);
 			await this.persistOAuthRefreshSchedule(provider);
@@ -3888,7 +3953,7 @@ export class AccountManager {
 				errorCode: failure.details.errorCode,
 				source: failure.details.source,
 			});
-			return failure;
+			return { failure };
 		}
 
 		if (failure.details.permanent) {
@@ -3914,7 +3979,7 @@ export class AccountManager {
 					expiresAt: credential.expires,
 					remainingMs: Math.max(0, credential.expires - now),
 				});
-				return failure;
+				return { failure };
 			}
 
 			if (provider === "openai-codex") {
@@ -3939,7 +4004,7 @@ export class AccountManager {
 			}
 		}
 
-		return failure;
+		return { failure };
 	}
 
 	/**
@@ -4024,7 +4089,7 @@ export class AccountManager {
 		}
 
 		if (credential.type === "oauth") {
-			const refreshResult = await this.refreshCredential(provider, credentialId);
+			const refreshResult = await this.refreshCredential(provider, credentialId, { allowDisabled: true });
 			if (refreshResult.disposition === "refreshed") {
 				this.scheduleOAuthRefresh(provider, credentialId, refreshResult.credential);
 				await this.persistOAuthRefreshSchedule(provider);
@@ -4101,6 +4166,7 @@ export class AccountManager {
 	async refreshCredential(
 		provider: SupportedProviderId,
 		credentialId: string,
+		options: OAuthCredentialRefreshOptions = {},
 	): Promise<CredentialRefreshResult> {
 		if (await this.isProviderHidden(provider)) {
 			throw new Error(`OAuth refresh skipped because provider ${provider} is hidden.`);
@@ -4134,7 +4200,17 @@ export class AccountManager {
 		let disposition: CredentialRefreshDisposition = "refreshed";
 		let shouldPersistRefreshSchedule = true;
 		try {
-			effectiveCredential = await this.refreshCredentialToken(provider, credentialId, credential);
+			const refreshOutcome = await this.refreshCredentialToken(
+				provider,
+				credentialId,
+				credential,
+				undefined,
+				options,
+			);
+			effectiveCredential = refreshOutcome.credential;
+			if (refreshOutcome.reusedCurrentCredential) {
+				disposition = "reused_current_token";
+			}
 			this.scheduleOAuthRefresh(provider, credentialId, effectiveCredential);
 		} catch (error) {
 			if (
@@ -5572,7 +5648,7 @@ export class AccountManager {
 		const excludedCredentialIds = getCredentialBackgroundExclusionIds(state);
 		const candidates = state.credentialIds
 			.map((credentialId, index): OperationalUsageWarmupCandidate | null => {
-				if (excludedCredentialIds.has(credentialId)) {
+				if (excludedCredentialIds.has(credentialId) || state.disabledCredentials?.[credentialId]) {
 					return null;
 				}
 				const cachedUsage = this.readCachedOperationalUsageForSelection(provider, credentialId);
@@ -6668,15 +6744,15 @@ export class AccountManager {
 		}
 
 		try {
-			const refreshedCredential = await this.refreshCredentialToken(
+			const refreshOutcome = await this.refreshCredentialToken(
 				provider,
 				credentialId,
 				credential,
 				signal,
 			);
-			this.scheduleOAuthRefresh(provider, credentialId, refreshedCredential);
+			this.scheduleOAuthRefresh(provider, credentialId, refreshOutcome.credential);
 			await this.persistOAuthRefreshSchedule(provider);
-			return refreshedCredential;
+			return refreshOutcome.credential;
 		} catch (error) {
 			if (
 				isOAuthRefreshFailureError(error) &&
@@ -6693,7 +6769,8 @@ export class AccountManager {
 		credentialId: string,
 		credential: StoredOAuthCredential,
 		signal?: AbortSignal,
-	): Promise<StoredOAuthCredential> {
+		options: OAuthCredentialRefreshOptions = {},
+	): Promise<OAuthCredentialRefreshOutcome> {
 		if (await this.isProviderHidden(provider)) {
 			throw new Error(`OAuth refresh skipped because provider ${provider} is hidden.`);
 		}
@@ -6701,9 +6778,9 @@ export class AccountManager {
 		if (this.shouldSkipOAuthRefreshForMissingRefreshToken(provider, credential)) {
 			this.oauthRefreshScheduler.cancelRefresh(credentialId);
 			await this.persistOAuthRefreshSchedule(provider);
-			return credential;
+			return { credential, reusedCurrentCredential: false };
 		}
-		const refreshKey = `${provider}:${credentialId}`;
+		const refreshKey = `${provider}:${credentialId}:${options.allowDisabled ? "allow-disabled" : "standard"}`;
 		const inFlightRefresh = this.oauthRefreshInFlight.get(refreshKey);
 		if (inFlightRefresh) {
 			return raceWithSignal(
@@ -6713,41 +6790,150 @@ export class AccountManager {
 			);
 		}
 
-		const refreshPromise = (async (): Promise<StoredOAuthCredential> => {
-			let refreshed: OAuthCredentials;
+		const refreshPromise = (async (): Promise<OAuthCredentialRefreshOutcome> => {
+			let releaseRefreshLock: (() => Promise<void>) | undefined;
+			let waitedForRefreshLock = false;
 			try {
-				refreshed = await refreshOAuthCredential(provider, credential, {
-					requestTimeoutMs: INTERNAL_OAUTH_REFRESH_CONFIG.requestTimeoutMs,
-				});
-			} catch (error) {
-				const recoveredCredential = await this.tryRecoverConcurrentCodexRefresh(
+				releaseRefreshLock = await acquireOAuthRefreshLock(
+					this.authWriter.getPath(),
 					provider,
 					credentialId,
-					credential,
-					error,
+					undefined,
+					{
+						onRetry: () => {
+							if (!waitedForRefreshLock) {
+								multiAuthDebugLogger.log("oauth_refresh_lock_wait", {
+									provider,
+									credentialRef: redactUsageCredentialIdentifier(credentialId),
+								});
+							}
+							waitedForRefreshLock = true;
+						},
+						onAcquired: (latencyMs) => {
+							if (waitedForRefreshLock) {
+								multiAuthDebugLogger.log("oauth_refresh_lock_acquired_after_wait", {
+									provider,
+									credentialRef: redactUsageCredentialIdentifier(credentialId),
+									latencyMs,
+								});
+							}
+						},
+						onStaleLockRemoved: (details) => {
+							multiAuthDebugLogger.log("oauth_refresh_lock_removed_stale", {
+								provider,
+								credentialRef: redactUsageCredentialIdentifier(credentialId),
+								ageMs: details.ageMs,
+								staleMs: details.staleMs,
+							});
+						},
+						onTimeout: (details) => {
+							multiAuthDebugLogger.log("oauth_refresh_lock_timeout", {
+								provider,
+								credentialRef: redactUsageCredentialIdentifier(credentialId),
+								attempt: details.attempt,
+								maxAttempts: details.maxAttempts,
+							});
+						},
+					},
 				);
-				if (recoveredCredential) {
-					return recoveredCredential;
+
+				// auth.json is intentionally reread only after this process owns the
+				// refresh scope. The auth.json write lock is not held during provider I/O.
+				const currentStoredCredential = await this.authWriter.getCredential(credentialId);
+				if (!currentStoredCredential) {
+					throw new Error(`Credential ${credentialId} was removed from auth.json while waiting to refresh.`);
+				}
+				if (currentStoredCredential.type !== "oauth") {
+					throw new Error(`Credential ${credentialId} is no longer an OAuth credential.`);
 				}
 
-				const failure = await this.logAndHandleOAuthRefreshFailure(
+				const recoveredAfterWait = await this.tryRecoverConcurrentOAuthRefresh(
 					provider,
 					credentialId,
 					credential,
-					error,
+					undefined,
+					"after_lock",
+					currentStoredCredential,
 				);
-				throw failure;
-			}
+				if (recoveredAfterWait) {
+					return { credential: recoveredAfterWait, reusedCurrentCredential: true };
+				}
+				if (!options.allowDisabled) {
+					const disabledFailure = await this.getDisabledOAuthRefreshFailure(provider, credentialId);
+					if (disabledFailure) {
+						throw disabledFailure;
+					}
+				}
+				if (this.shouldSkipOAuthRefreshForMissingRefreshToken(provider, currentStoredCredential)) {
+					this.oauthRefreshScheduler.cancelRefresh(credentialId);
+					await this.persistOAuthRefreshSchedule(provider);
+					return { credential: currentStoredCredential, reusedCurrentCredential: false };
+				}
 
-			await this.authWriter.setOAuthCredential(credentialId, refreshed);
-			await this.clearRecoveredOAuthRefreshFailureState(provider, credentialId, {
-				type: "oauth",
-				...refreshed,
-			});
-			return {
-				type: "oauth",
-				...refreshed,
-			};
+				let refreshed: OAuthCredentials;
+				try {
+					refreshed = await refreshOAuthCredential(provider, currentStoredCredential, {
+						requestTimeoutMs: INTERNAL_OAUTH_REFRESH_CONFIG.requestTimeoutMs,
+					});
+				} catch (error) {
+					const handled = await this.logAndHandleOAuthRefreshFailure(
+						provider,
+						credentialId,
+						currentStoredCredential,
+						error,
+					);
+					if (handled.recoveredCredential) {
+						return {
+							credential: handled.recoveredCredential,
+							reusedCurrentCredential: true,
+						};
+					}
+					throw handled.failure;
+				}
+
+				const writeResult = await this.authWriter.setOAuthCredentialIfUnchanged(
+					credentialId,
+					currentStoredCredential,
+					refreshed,
+				);
+				if (writeResult.status === "changed") {
+					const recoveredBeforePersist = writeResult.credential
+						? await this.tryRecoverConcurrentOAuthRefresh(
+							provider,
+							credentialId,
+							currentStoredCredential,
+							undefined,
+							"before_persist",
+							writeResult.credential,
+						)
+						: null;
+					if (recoveredBeforePersist) {
+						return { credential: recoveredBeforePersist, reusedCurrentCredential: true };
+					}
+					throw new Error(
+						`Credential ${credentialId} changed type or was removed while its OAuth token was refreshing.`,
+					);
+				}
+
+				await this.clearRecoveredOAuthRefreshFailureState(
+					provider,
+					credentialId,
+					writeResult.credential,
+				);
+				return { credential: writeResult.credential, reusedCurrentCredential: false };
+			} finally {
+				if (releaseRefreshLock) {
+					try {
+						await releaseRefreshLock();
+					} catch (error) {
+						multiAuthDebugLogger.log("oauth_refresh_lock_release_failed", {
+							provider,
+							credentialRef: redactUsageCredentialIdentifier(credentialId),
+							message: getErrorMessage(error),
+						});
+					}
+				}
+			}
 		})().finally(() => {
 			this.oauthRefreshInFlight.delete(refreshKey);
 		});
@@ -7155,6 +7341,13 @@ export class AccountManager {
 			const providerState = getProviderState(state, provider);
 			const nextScheduled: Record<string, number> = {};
 			for (const credentialId of providerState.credentialIds) {
+				if (providerState.disabledCredentials?.[credentialId]) {
+					continue;
+				}
+				const exhaustedUntil = providerState.quotaExhaustedUntil?.[credentialId];
+				if (typeof exhaustedUntil === "number" && exhaustedUntil > Date.now()) {
+					continue;
+				}
 				const scheduledEntry = scheduled.get(credentialId);
 				if (scheduledEntry?.providerId === provider) {
 					nextScheduled[credentialId] = scheduledEntry.scheduledAt;
@@ -7192,11 +7385,14 @@ export class AccountManager {
 		}
 
 		try {
-			const refreshed = await this.refreshCredentialToken(provider, credentialId, credential);
-			this.scheduleOAuthRefresh(provider, credentialId, refreshed);
+			const refreshOutcome = await this.refreshCredentialToken(provider, credentialId, credential);
+			this.scheduleOAuthRefresh(provider, credentialId, refreshOutcome.credential);
 			await this.persistOAuthRefreshSchedule(provider);
 			this.enqueueCredentialUsageRefresh(provider, [credentialId], "manual-account-refresh");
-			return determineTokenExpiration(refreshed.access, refreshed.expires).expiresAt;
+			return determineTokenExpiration(
+				refreshOutcome.credential.access,
+				refreshOutcome.credential.expires,
+			).expiresAt;
 		} catch (error) {
 			if (isOAuthRefreshFailureError(error) && error.details.permanent) {
 				throw error;

@@ -501,12 +501,12 @@ test("usage service reuses fresh negative cache even for forced refreshes", asyn
 	assert.equal(second.error, first.error);
 });
 
-test("usage service harvests rate-limit headers into operational usage cache", () => {
+test("usage service harvests rate-limit headers into operational usage cache", async () => {
 	const usageService = new UsageService(30_000, 300_000, 10_000, undefined, { persistentCache: false });
 	const credentialCacheKey = "cache-key-a";
 	const observedAt = Date.now();
 
-	const harvested = usageService.harvestRateLimitHeaders(
+	const harvested = await usageService.harvestRateLimitHeaders(
 		"openai-codex",
 		"credential-a",
 		credentialCacheKey,

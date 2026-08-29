@@ -1,11 +1,14 @@
 import { createHash } from "node:crypto";
 import { getErrorMessage } from "../auth-error-utils.js";
+import { multiAuthDebugLogger } from "../debug-logger.js";
 import { quotaClassifier } from "../quota-classifier.js";
 import { rateLimitHeaderParser } from "../rate-limit-headers.js";
 import { usageProviders } from "./providers.js";
 import {
+	UsageRefreshLockTimeoutError,
 	UsageSnapshotCacheStore,
 	type UsageCacheHydrationOptions,
+	type UsageCacheHydrationSnapshot,
 	type UsageCachePersistenceOptions,
 	type UsageCacheRecord,
 	type UsageDisplayCacheRecord,
@@ -29,11 +32,13 @@ interface UsageCacheEntry {
 	result: Omit<UsageFetchResult, "fromCache">;
 	freshUntil: number;
 	staleUntil: number;
+	revision?: number;
 }
 
 interface UsageDisplayCacheEntry {
 	result: Omit<UsageFetchResult, "fromCache">;
 	displayUntil: number;
+	revision?: number;
 }
 
 interface ResolvedUsageCacheRead {
@@ -41,13 +46,25 @@ interface ResolvedUsageCacheRead {
 	isStale: boolean;
 }
 
+interface FreshUsageExecution {
+	result: Omit<UsageFetchResult, "fromCache">;
+	fromSharedCache: boolean;
+}
+
+interface UsageCacheEntryVersion {
+	revision: number;
+	fetchedAt: number;
+	freshUntil: number;
+	staleUntil: number;
+}
+
 export interface UsageServiceOptions {
 	persistentCache?: UsageSnapshotCacheStore | UsageCachePersistenceOptions | false;
 }
 
 class UsageFetchCompletedWithError extends Error {
-	constructor(readonly result: Omit<UsageFetchResult, "fromCache">) {
-		super(result.error ?? "Usage unavailable");
+	constructor(readonly execution: FreshUsageExecution) {
+		super(execution.result.error ?? "Usage unavailable");
 		this.name = "UsageFetchCompletedWithError";
 	}
 }
@@ -165,8 +182,11 @@ export class UsageService {
 	private readonly displayCache = new Map<string, UsageDisplayCacheEntry>();
 	private readonly displayCacheKeysByCredential = new Map<string, Set<string>>();
 	private readonly preferredCredentialCacheKeys = new Map<string, string>();
-	private readonly inFlight = new Map<string, Promise<Omit<UsageFetchResult, "fromCache">>>();
+	private readonly inFlight = new Map<string, Promise<FreshUsageExecution>>();
 	private readonly persistentCacheStore?: UsageSnapshotCacheStore;
+	private persistentCacheFingerprint: string | null | undefined;
+	private persistentHydrationOptions: UsageCacheHydrationOptions = {};
+	private persistentRefreshInFlight: Promise<void> | null = null;
 
 	constructor(
 		private readonly freshTtlMs: number = DEFAULT_USAGE_FRESH_TTL_MS,
@@ -216,25 +236,100 @@ export class UsageService {
 		if (!this.persistentCacheStore) {
 			return;
 		}
-		const { operationalEntries, displayEntries } = await this.persistentCacheStore.readHydrationEntries(
-			Date.now(),
-			options,
-		);
-		for (const entry of operationalEntries) {
-			this.setCacheEntry(
-				entry.providerId,
-				entry.credentialId,
-				entry.credentialCacheKey,
-				{
-					result: entry.result,
-					freshUntil: entry.freshUntil,
-					staleUntil: entry.staleUntil,
-				},
+		// Initial hydration may prune records against the credentials known at startup.
+		// Subsequent live reads intentionally do not retain those validators: OAuth
+		// access-token rotation changes credentialCacheKey, and credentials may be
+		// added by another running CLI. Exact preferred-key matching below keeps old
+		// credential material from becoming operational while allowing the new key
+		// to propagate without a restart.
+		this.persistentHydrationOptions = {
+			resolveLegacyCredentialCacheKey: options.resolveLegacyCredentialCacheKey,
+			pruneInvalidEntries: false,
+		};
+		const snapshot = await this.persistentCacheStore.readHydrationSnapshot(Date.now(), options);
+		this.applyPersistentCacheSnapshot(snapshot);
+	}
+
+	/**
+	 * Rechecks the shared cache and merges records written by other running CLI processes.
+	 */
+	async refreshPersistedCache(): Promise<void> {
+		if (!this.persistentCacheStore) {
+			return;
+		}
+		if (this.persistentRefreshInFlight) {
+			return this.persistentRefreshInFlight;
+		}
+		const refresh = (async () => {
+			const snapshot = await this.persistentCacheStore!.readHydrationSnapshot(
+				Date.now(),
+				this.persistentHydrationOptions,
 			);
+			this.applyPersistentCacheSnapshot(snapshot);
+		})();
+		this.persistentRefreshInFlight = refresh;
+		try {
+			await refresh;
+		} finally {
+			if (this.persistentRefreshInFlight === refresh) {
+				this.persistentRefreshInFlight = null;
+			}
 		}
-		for (const entry of displayEntries) {
-			this.setDisplayCacheEntry(entry);
+	}
+
+	private async refreshPersistedCacheAfterLock(): Promise<void> {
+		if (!this.persistentCacheStore) {
+			return;
 		}
+		// A pre-existing read may have started before the lock winner published.
+		// Wait for it, then force a distinct read made after lock acquisition.
+		if (this.persistentRefreshInFlight) {
+			await this.persistentRefreshInFlight.catch(() => undefined);
+		}
+		const snapshot = await this.persistentCacheStore.readHydrationSnapshot(
+			Date.now(),
+			this.persistentHydrationOptions,
+		);
+		this.applyPersistentCacheSnapshot(snapshot);
+	}
+
+	private refreshPersistedCacheIfChangedSync(): void {
+		if (!this.persistentCacheStore) {
+			return;
+		}
+		const snapshot = this.persistentCacheStore.readHydrationSnapshotIfChangedSync(
+			this.persistentCacheFingerprint,
+			Date.now(),
+			this.persistentHydrationOptions,
+		);
+		if (snapshot) {
+			this.applyPersistentCacheSnapshot(snapshot);
+		}
+	}
+
+	private applyPersistentCacheSnapshot(snapshot: UsageCacheHydrationSnapshot): void {
+		for (const entry of snapshot.operationalEntries) {
+			const key = cacheKey(entry.providerId, entry.credentialId, entry.credentialCacheKey);
+			const preferredKey = this.preferredCredentialCacheKeys.get(
+				providerCredentialIndexKey(entry.providerId, entry.credentialId),
+			);
+			if (preferredKey && preferredKey !== key) {
+				continue;
+			}
+			const candidate: UsageCacheEntry = {
+				result: entry.result,
+				freshUntil: entry.freshUntil,
+				staleUntil: entry.staleUntil,
+				revision: entry.revision,
+			};
+			if (this.shouldReplaceCacheEntry(this.cache.get(key), candidate)) {
+				this.setCacheEntry(entry.providerId, entry.credentialId, entry.credentialCacheKey, candidate);
+			}
+		}
+		for (const entry of snapshot.displayEntries) {
+			this.mergeDisplayCacheEntry(entry);
+		}
+		this.persistentCacheFingerprint = snapshot.fingerprint;
 	}
 
 	/**
@@ -292,6 +387,7 @@ export class UsageService {
 		credentialId: string,
 		options: UsageFetchOptions = {},
 	): UsageFetchResult | null {
+		this.refreshPersistedCacheIfChangedSync();
 		return this.resolveCachedReadForCredential(providerId, credentialId, options, Date.now())?.result ?? null;
 	}
 
@@ -299,19 +395,21 @@ export class UsageService {
 	 * Reads a display-only last-known usage snapshot without exposing it to operational decisions.
 	 */
 	readDisplayUsage(providerId: string, credentialId: string): UsageFetchResult | null {
+		this.refreshPersistedCacheIfChangedSync();
 		return this.resolveDisplayReadForCredential(providerId, credentialId, Date.now());
 	}
 
 	/**
 	 * Updates operational usage cache from response headers observed by existing provider hooks.
 	 */
-	harvestRateLimitHeaders(
+	async harvestRateLimitHeaders(
 		providerId: string,
 		credentialId: string,
 		credentialCacheKey: string,
 		headers: Record<string, string | undefined>,
 		observedAt: number = Date.now(),
-	): UsageFetchResult | null {
+	): Promise<UsageFetchResult | null> {
+		this.refreshPersistedCacheIfChangedSync();
 		const parsedHeaders = rateLimitHeaderParser.parseHeaders(headers, providerId);
 		if (!hasUsableRateLimitHeaders(parsedHeaders)) {
 			return null;
@@ -343,12 +441,7 @@ export class UsageService {
 			error: null,
 			fetchedAt: observedAt,
 		};
-		const freshTtlMs = this.resolveSuccessFreshTtlMs(snapshot, observedAt);
-		this.setCacheEntry(providerId, credentialId, credentialCacheKey, {
-			result,
-			freshUntil: observedAt + freshTtlMs,
-			staleUntil: observedAt + Math.max(this.staleTtlMs, freshTtlMs),
-		});
+		await this.cacheResult(providerId, credentialId, credentialCacheKey, result, false);
 
 		return {
 			...result,
@@ -365,6 +458,7 @@ export class UsageService {
 		auth: UsageAuth,
 		options: UsageFetchOptions = {},
 	): Promise<UsageFetchResult> {
+		this.refreshPersistedCacheIfChangedSync();
 		const credentialCacheKey = createUsageCredentialCacheKey(providerId, credentialId, auth);
 		const key = cacheKey(providerId, credentialId, credentialCacheKey);
 		const resolvedCachedRead = this.resolveCachedRead(key, options, Date.now());
@@ -373,16 +467,17 @@ export class UsageService {
 		}
 
 		const staleCandidate = resolvedCachedRead?.isStale ? resolvedCachedRead.result : undefined;
+		const baselineVersion = this.captureCacheEntryVersion(this.cache.get(key));
 		const existingInFlight = this.inFlight.get(key);
 		if (existingInFlight) {
 			if (staleCandidate) {
 				return staleCandidate;
 			}
 
-			const result = await existingInFlight;
+			const execution = await existingInFlight;
 			return {
-				...result,
-				fromCache: false,
+				...execution.result,
+				fromCache: execution.fromSharedCache,
 			};
 		}
 
@@ -392,6 +487,8 @@ export class UsageService {
 			auth,
 			key,
 			credentialCacheKey,
+			options,
+			baselineVersion,
 			options.coordinationOperation ?? "direct",
 		);
 		this.inFlight.set(key, fetchPromise);
@@ -407,10 +504,10 @@ export class UsageService {
 			return staleCandidate;
 		}
 
-		const result = await settledFetch;
+		const execution = await settledFetch;
 		return {
-			...result,
-			fromCache: false,
+			...execution.result,
+			fromCache: execution.fromSharedCache,
 		};
 	}
 
@@ -431,8 +528,79 @@ export class UsageService {
 		this.displayCache.set(key, {
 			result: entry.result,
 			displayUntil: entry.displayUntil,
+			revision: entry.revision,
 		});
 		this.setCacheIndex(entry.providerId, entry.credentialId, key, this.displayCacheKeysByCredential);
+	}
+
+	private shouldReplaceCacheEntry(
+		existing: UsageCacheEntry | undefined,
+		candidate: UsageCacheEntry,
+	): boolean {
+		if (!existing) {
+			return true;
+		}
+		if (candidate.result.fetchedAt !== existing.result.fetchedAt) {
+			return candidate.result.fetchedAt > existing.result.fetchedAt;
+		}
+		const candidateRevision = candidate.revision ?? 0;
+		const existingRevision = existing.revision ?? 0;
+		if (candidateRevision !== existingRevision) {
+			return candidateRevision > existingRevision;
+		}
+		return candidate.freshUntil >= existing.freshUntil;
+	}
+
+	private mergeDisplayCacheEntry(entry: UsageDisplayCacheRecord): void {
+		const key = cacheKey(entry.providerId, entry.credentialId, entry.credentialCacheKey);
+		const existing = this.displayCache.get(key);
+		const incoming: UsageDisplayCacheEntry = {
+			result: entry.result,
+			displayUntil: entry.displayUntil,
+			revision: entry.revision,
+		};
+		if (existing && !this.isDisplayEntryNewer(incoming, existing)) {
+			return;
+		}
+		this.setDisplayCacheEntry(entry);
+	}
+
+	private isDisplayEntryNewer(
+		candidate: UsageDisplayCacheEntry,
+		existing: UsageDisplayCacheEntry,
+	): boolean {
+		if (candidate.result.fetchedAt !== existing.result.fetchedAt) {
+			return candidate.result.fetchedAt > existing.result.fetchedAt;
+		}
+		return (candidate.revision ?? 0) >= (existing.revision ?? 0);
+	}
+
+	private captureCacheEntryVersion(entry: UsageCacheEntry | undefined): UsageCacheEntryVersion | null {
+		return entry
+			? {
+				revision: entry.revision ?? 0,
+				fetchedAt: entry.result.fetchedAt,
+				freshUntil: entry.freshUntil,
+				staleUntil: entry.staleUntil,
+			}
+			: null;
+	}
+
+	private isCacheEntryNewerThanVersion(
+		entry: UsageCacheEntry | undefined,
+		baseline: UsageCacheEntryVersion | null,
+	): boolean {
+		if (!entry) {
+			return false;
+		}
+		if (!baseline) {
+			return true;
+		}
+		const revision = entry.revision ?? 0;
+		return revision > baseline.revision ||
+			entry.result.fetchedAt > baseline.fetchedAt ||
+			entry.freshUntil > baseline.freshUntil ||
+			entry.staleUntil > baseline.staleUntil;
 	}
 
 	private setCacheIndex(
@@ -530,12 +698,12 @@ export class UsageService {
 		options: UsageFetchOptions,
 		now: number,
 	): ResolvedUsageCacheRead | null {
-		const preferredRead = this.resolvePreferredCachedRead(providerId, credentialId, options, now);
-		if (preferredRead) {
-			return preferredRead;
+		const indexKey = providerCredentialIndexKey(providerId, credentialId);
+		if (this.preferredCredentialCacheKeys.has(indexKey)) {
+			return this.resolvePreferredCachedRead(providerId, credentialId, options, now);
 		}
 
-		const keys = this.cacheKeysByCredential.get(providerCredentialIndexKey(providerId, credentialId));
+		const keys = this.cacheKeysByCredential.get(indexKey);
 		if (!keys || keys.size === 0) {
 			return null;
 		}
@@ -701,45 +869,126 @@ export class UsageService {
 		auth: UsageAuth,
 		key: string,
 		credentialCacheKey: string,
+		options: UsageFetchOptions,
+		baselineVersion: UsageCacheEntryVersion | null,
 		operation: UsageCoordinationOperation,
-	): Promise<Omit<UsageFetchResult, "fromCache">> {
+	): Promise<FreshUsageExecution> {
 		const provider = this.providers.get(providerId);
+		const execute = () => this.fetchWithCrossProcessCoordination(
+			providerId,
+			credentialId,
+			auth,
+			key,
+			credentialCacheKey,
+			options,
+			baselineVersion,
+		);
 		if (!this.usageCoordinator || !provider?.fetchUsage) {
-			return this.fetchAndCache(providerId, credentialId, auth, key, credentialCacheKey);
+			return execute();
 		}
 
 		return this.usageCoordinator
 			.executeFreshRequest(
 				{ provider: providerId, credentialId, operation },
 				async () => {
-					const result = await this.fetchAndCache(
-						providerId,
-						credentialId,
-						auth,
-						key,
-						credentialCacheKey,
-					);
-					if (result.error) {
-						throw new UsageFetchCompletedWithError(result);
+					const execution = await execute();
+					if (execution.result.error) {
+						throw new UsageFetchCompletedWithError(execution);
 					}
-					return result;
+					return execution;
 				},
 			)
 			.catch((error: unknown) => {
 				if (error instanceof UsageFetchCompletedWithError) {
-					return error.result;
+					return error.execution;
 				}
 				throw error;
 			});
+	}
+
+	private async fetchWithCrossProcessCoordination(
+		providerId: string,
+		credentialId: string,
+		auth: UsageAuth,
+		key: string,
+		credentialCacheKey: string,
+		options: UsageFetchOptions,
+		baselineVersion: UsageCacheEntryVersion | null,
+	): Promise<FreshUsageExecution> {
+		if (!this.persistentCacheStore) {
+			return this.fetchAndCache(providerId, credentialId, auth, credentialCacheKey);
+		}
+
+		try {
+			return await this.persistentCacheStore.withCredentialRefreshLock(
+				providerId,
+				credentialId,
+				credentialCacheKey,
+				async ({ contended }) => {
+					await this.refreshPersistedCacheAfterLock();
+					const sharedRead = this.resolveCachedRead(
+						key,
+						{ ...options, forceRefresh: false, allowStale: false },
+						Date.now(),
+					);
+					const currentEntry = this.cache.get(key);
+					const mayConsumeSharedResult = !options.forceRefresh ||
+						contended ||
+						this.isCacheEntryNewerThanVersion(currentEntry, baselineVersion);
+					if (sharedRead && !sharedRead.isStale && mayConsumeSharedResult) {
+						return {
+							result: {
+								snapshot: sharedRead.result.snapshot,
+								error: sharedRead.result.error,
+								fetchedAt: sharedRead.result.fetchedAt,
+							},
+							fromSharedCache: true,
+						};
+					}
+					return this.fetchAndCache(providerId, credentialId, auth, credentialCacheKey);
+				},
+			);
+		} catch (error: unknown) {
+			// A final cache read covers a winner that published at the wait deadline.
+			await this.refreshPersistedCacheAfterLock().catch(() => undefined);
+			const sharedRead = this.resolveCachedRead(
+				key,
+				{ ...options, forceRefresh: false, allowStale: false },
+				Date.now(),
+			);
+			if (sharedRead && !sharedRead.isStale) {
+				return {
+					result: {
+						snapshot: sharedRead.result.snapshot,
+						error: sharedRead.result.error,
+						fetchedAt: sharedRead.result.fetchedAt,
+					},
+					fromSharedCache: true,
+				};
+			}
+
+			const fetchedAt = Date.now();
+			const message = error instanceof UsageRefreshLockTimeoutError
+				? "timed out waiting for another process to finish the usage refresh"
+				: `shared refresh coordination failed: ${getErrorMessage(error)}`;
+			const result: Omit<UsageFetchResult, "fromCache"> = {
+				snapshot: null,
+				error: `Usage unavailable (${message})`,
+				fetchedAt,
+			};
+			// Never publish a coordination failure while another process may still
+			// own the refresh lock; that could hide the eventual winner.
+			await this.cacheResult(providerId, credentialId, credentialCacheKey, result, true, message, false);
+			return { result, fromSharedCache: false };
+		}
 	}
 
 	private async fetchAndCache(
 		providerId: string,
 		credentialId: string,
 		auth: UsageAuth,
-		key: string,
 		credentialCacheKey: string,
-	): Promise<Omit<UsageFetchResult, "fromCache">> {
+	): Promise<FreshUsageExecution> {
 		const provider = this.providers.get(providerId);
 		if (!provider?.fetchUsage) {
 			const fetchedAt = Date.now();
@@ -749,7 +998,7 @@ export class UsageService {
 				fetchedAt,
 			};
 			await this.cacheResult(providerId, credentialId, credentialCacheKey, result, true);
-			return result;
+			return { result, fromSharedCache: false };
 		}
 
 		try {
@@ -761,7 +1010,7 @@ export class UsageService {
 				fetchedAt,
 			};
 			await this.cacheResult(providerId, credentialId, credentialCacheKey, result, snapshot === null);
-			return result;
+			return { result, fromSharedCache: false };
 		} catch (error: unknown) {
 			const fetchedAt = Date.now();
 			const message = getErrorMessage(error);
@@ -771,7 +1020,7 @@ export class UsageService {
 				fetchedAt,
 			};
 			await this.cacheResult(providerId, credentialId, credentialCacheKey, result, true, message);
-			return result;
+			return { result, fromSharedCache: false };
 		}
 	}
 
@@ -782,6 +1031,7 @@ export class UsageService {
 		result: Omit<UsageFetchResult, "fromCache">,
 		isError: boolean,
 		errorMessage?: string,
+		persist: boolean = true,
 	): Promise<void> {
 		const freshTtlMs = isError
 			? this.resolveErrorTtlMs(errorMessage)
@@ -795,22 +1045,44 @@ export class UsageService {
 		};
 		this.setCacheEntry(providerId, credentialId, credentialCacheKey, entry);
 
-		if (!isError && result.snapshot && this.persistentCacheStore) {
-			const persistentEntry: UsageCacheRecord = {
-				providerId,
-				credentialId,
-				credentialCacheKey,
-				result,
-				freshUntil: entry.freshUntil,
-				staleUntil: entry.staleUntil,
-			};
-			const displayEntry = await this.persistentCacheStore.persistSuccessfulEntry(
+		if (!persist || !this.persistentCacheStore) {
+			return;
+		}
+		const persistentEntry: UsageCacheRecord = {
+			providerId,
+			credentialId,
+			credentialCacheKey,
+			result,
+			freshUntil: entry.freshUntil,
+			staleUntil: entry.staleUntil,
+		};
+		try {
+			const persisted = await this.persistentCacheStore.persistEntry(
 				persistentEntry,
 				result.fetchedAt,
 			);
-			if (displayEntry) {
-				this.setDisplayCacheEntry(displayEntry);
+			if (!persisted) {
+				return;
 			}
+			const persistedEntry: UsageCacheEntry = {
+				result: persisted.operationalEntry.result,
+				freshUntil: persisted.operationalEntry.freshUntil,
+				staleUntil: persisted.operationalEntry.staleUntil,
+				revision: persisted.operationalEntry.revision,
+			};
+			const key = cacheKey(providerId, credentialId, credentialCacheKey);
+			if (this.shouldReplaceCacheEntry(this.cache.get(key), persistedEntry)) {
+				this.setCacheEntry(providerId, credentialId, credentialCacheKey, persistedEntry);
+			}
+			if (persisted.displayEntry) {
+				this.mergeDisplayCacheEntry(persisted.displayEntry);
+			}
+		} catch (error: unknown) {
+			multiAuthDebugLogger.log("usage_cache_result_persist_failed", {
+				provider: providerId,
+				credentialRef: digestUsageCacheComponent(credentialId).slice(0, 12),
+				error: getErrorMessage(error),
+			});
 		}
 	}
 
