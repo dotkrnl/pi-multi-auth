@@ -1,34 +1,10 @@
+import type { RateLimitWindow } from "./usage/types.js";
 import type { CredentialStatus, ProviderStatus } from "./types.js";
 
 /**
- * Shared, read-only projection of AccountManager.getStatus() used by the
- * footer quota indicator and the `/multi-auth status` inline report.
+ * Read-only formatting helpers over AccountManager.getStatus() results: the
+ * compact footer quota indicator and the `/multi-auth status` inline report.
  */
-
-export interface ProviderUsageSummary {
-	provider: string;
-	rotationMode: string;
-	accountCount: number;
-	/** Label for the active credential: friendly name, identity email, or id. */
-	activeLabel?: string;
-	/** Active credential's primary (short) window usage, 0-100. */
-	primaryPercent?: number;
-	/** Active credential's secondary (long/weekly) window usage, 0-100. */
-	secondaryPercent?: number;
-	/** Active credential's tertiary (monthly) window usage, 0-100. */
-	monthlyPercent?: number;
-	/** Active credential's primary window length in minutes (for statusline suffixes). */
-	primaryWindowMinutes?: number;
-	/** Active credential's secondary window length in minutes (for statusline suffixes). */
-	secondaryWindowMinutes?: number;
-	/** Active credential's monthly window length in minutes (for statusline suffixes). */
-	monthlyWindowMinutes?: number;
-	planType?: string;
-	/** True when the active credential is in a quota cooldown. */
-	activeQuotaExhausted: boolean;
-	/** True when the active credential's usage data is stale/unavailable. */
-	activeUsageUnavailable: boolean;
-}
 
 function formatWindowMinutes(windowMinutes: number | null): string | null {
 	if (windowMinutes === null || !Number.isFinite(windowMinutes) || windowMinutes <= 0) {
@@ -52,45 +28,13 @@ function credentialLabel(credential: CredentialStatus): string {
 	return credential.friendlyName ?? credential.identityEmail ?? credential.credentialId;
 }
 
-export function summarizeProviderStatuses(
-	statuses: readonly ProviderStatus[],
-	now: number = Date.now(),
-): ProviderUsageSummary[] {
-	const summaries: ProviderUsageSummary[] = [];
-	for (const status of statuses) {
-		if (status.credentials.length === 0) {
-			continue;
-		}
-		const active =
-			status.credentials.find((credential) => credential.isActive) ?? status.credentials[0];
-		const snapshot = active.usageSnapshot ?? null;
-		summaries.push({
-			provider: status.provider,
-			rotationMode: status.rotationMode,
-			accountCount: status.credentials.length,
-			activeLabel: credentialLabel(active),
-			primaryPercent: snapshot?.primary?.usedPercent,
-			secondaryPercent: snapshot?.secondary?.usedPercent,
-			monthlyPercent: snapshot?.monthly?.usedPercent,
-			primaryWindowMinutes: snapshot?.primary?.windowMinutes ?? undefined,
-			secondaryWindowMinutes: snapshot?.secondary?.windowMinutes ?? undefined,
-			monthlyWindowMinutes: snapshot?.monthly?.windowMinutes ?? undefined,
-			planType: snapshot?.planType ?? active.identityPlanType,
-			activeQuotaExhausted:
-				typeof active.quotaExhaustedUntil === "number" && active.quotaExhaustedUntil > now,
-			activeUsageUnavailable: !snapshot,
-		});
-	}
-	return summaries;
-}
-
 /**
  * Single-letter statusline suffix for a window length: `h`ourly, `d`aily,
  * `w`eekly, `m`onthly. Returns an empty string for unknown/short windows so the
  * primary (short) window renders bare (e.g. `54`, not `54h`).
  */
-function formatWindowSuffix(windowMinutes?: number): string {
-	if (typeof windowMinutes !== "number" || !Number.isFinite(windowMinutes) || windowMinutes <= 0) {
+function formatWindowSuffix(windowMinutes: number | null | undefined): string {
+	if (windowMinutes === null || typeof windowMinutes !== "number" || !Number.isFinite(windowMinutes) || windowMinutes <= 0) {
 		return "";
 	}
 	if (windowMinutes >= 25 * 24 * 60) {
@@ -103,24 +47,6 @@ function formatWindowSuffix(windowMinutes?: number): string {
 		return "d";
 	}
 	return "h";
-}
-
-function formatUsageGroup(summary: ProviderUsageSummary): string | null {
-	const parts: string[] = [];
-	if (typeof summary.primaryPercent === "number") {
-		parts.push(`${Math.round(summary.primaryPercent)}`);
-	}
-	if (typeof summary.secondaryPercent === "number") {
-		// Secondary is conventionally the weekly/long window; fall back to `w`
-		// when the provider's snapshot omits windowMinutes (e.g. kimi-coding).
-		const secondarySuffix = formatWindowSuffix(summary.secondaryWindowMinutes) || "w";
-		parts.push(`${Math.round(summary.secondaryPercent)}${secondarySuffix}`);
-	}
-	if (typeof summary.monthlyPercent === "number") {
-		const monthlySuffix = formatWindowSuffix(summary.monthlyWindowMinutes) || "m";
-		parts.push(`${Math.round(summary.monthlyPercent)}${monthlySuffix}`);
-	}
-	return parts.length > 0 ? parts.join("/") : null;
 }
 
 /**
@@ -155,21 +81,69 @@ export function formatProviderStatuslineAlias(provider: string): string {
 }
 
 /**
- * Compact single-line footer text, e.g. "kimi|54/85w  go|12/24w/36m  gpt|7".
- * The primary (short) window is bare; secondary and monthly windows carry a
- * size suffix (`w`/`m`). Returns undefined when no provider has usage data.
+ * One statusline cell for a single account + window: the used percent rounded
+ * to an integer with the window suffix (bare for the primary window). Returns
+ * `–` when the account has no usage data for that window.
  */
-export function formatQuotaStatusLine(
-	summaries: readonly ProviderUsageSummary[],
+function formatWindowCell(window: RateLimitWindow | null | undefined, suffix: string): string {
+	if (!window || typeof window.usedPercent !== "number" || !Number.isFinite(window.usedPercent)) {
+		return "–";
+	}
+	return `${Math.round(window.usedPercent)}${suffix}`;
+}
+
+/**
+ * Compact single-line footer text listing every account's quota, grouped by
+ * quota window instead of by account, e.g.
+ * "kimi|54|12|85w|27w  go|12|24w|36m".
+ *
+ * Grammar: `<alias>|<primary: acct1>|<primary: acct2>|...  <weekly: acct1>|<weekly: acct2>|...w  <monthly...>m`
+ *
+ * - Accounts appear in stored credential index order (the same order as the
+ *   `/multi-auth` modal account list), so within each `|`-separated run the
+ *   n-th value belongs to the n-th account.
+ * - The primary (short) window is bare; secondary/weekly and monthly windows
+ *   carry a size suffix (`w`/`m`).
+ * - `–` marks an account without data for that window; a whole window run is
+ *   dropped when no account has data for it.
+ * Returns undefined when no provider has usage data.
+ */
+export function formatAllAccountsQuotaStatusLine(
+	statuses: readonly ProviderStatus[],
 ): string | undefined {
 	const segments: string[] = [];
-	for (const summary of summaries) {
-		const usage = formatUsageGroup(summary);
-		if (!usage) {
+	for (const status of statuses) {
+		const credentials = [...status.credentials].sort((a, b) => a.index - b.index);
+		if (credentials.length === 0) {
 			continue;
 		}
-		const exhaustedMarker = summary.activeQuotaExhausted ? "!" : "";
-		segments.push(`${formatProviderStatuslineAlias(summary.provider)}|${usage}${exhaustedMarker}`);
+		const groups: string[][] = [[], [], []];
+		for (const credential of credentials) {
+			const snapshot = credential.usageSnapshot;
+			groups[0].push(formatWindowCell(snapshot?.primary, ""));
+			groups[1].push(
+				formatWindowCell(
+					snapshot?.secondary,
+					formatWindowSuffix(snapshot?.secondary?.windowMinutes) || "w",
+				),
+			);
+			groups[2].push(
+				formatWindowCell(
+					snapshot?.monthly,
+					formatWindowSuffix(snapshot?.monthly?.windowMinutes) || "m",
+				),
+			);
+		}
+		const runs: string[] = [];
+		for (const values of groups) {
+			if (values.some((value) => value !== "–")) {
+				runs.push(values.join("|"));
+			}
+		}
+		if (runs.length === 0) {
+			continue;
+		}
+		segments.push(`${formatProviderStatuslineAlias(status.provider)}|${runs.join("|")}`);
 	}
 	return segments.length > 0 ? segments.join("  ") : undefined;
 }

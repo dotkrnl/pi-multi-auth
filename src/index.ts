@@ -29,9 +29,8 @@ import {
 } from "./runtime-context.js";
 import { resolveAgentRuntimePath } from "./runtime-paths.js";
 import {
-	formatQuotaStatusLine,
+	formatAllAccountsQuotaStatusLine,
 	formatStatusReport,
-	summarizeProviderStatuses,
 } from "./status-summary.js";
 
 const STARTUP_WARMUP_DELAY_MS = 0;
@@ -371,7 +370,7 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 		footerRefreshInFlight = (async () => {
 			try {
 				const statuses = await accountManager.getStatus();
-				const line = formatQuotaStatusLine(summarizeProviderStatuses(statuses));
+				const line = formatAllAccountsQuotaStatusLine(statuses);
 				if (footerCtx === ctx) {
 					ctx.ui.setStatus(FOOTER_STATUS_KEY, line);
 				}
