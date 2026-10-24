@@ -1,6 +1,8 @@
 import { readFile, stat } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { getModels, getProviders } from "@earendil-works/pi-ai/compat";
+import { getBuiltinModelDataGeneratedAt } from "@earendil-works/pi-ai/providers/all";
 import { getOAuthProvider, getOAuthProviders } from "./oauth-compat.js";
 import { registerClineOAuthProvider } from "./oauth-cline.js";
 import { registerKiloOAuthProvider } from "./oauth-kilo.js";
@@ -103,7 +105,7 @@ const FIRST_CLASS_OAUTH_PROVIDER_REGISTRARS: Record<string, () => void> = {
 	qwen: registerQwenOAuthProvider,
 };
 
-const THINKING_LEVEL_KEYS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+const THINKING_LEVEL_KEYS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 function ensureProviderOAuthRegistration(provider: SupportedProviderId): void {
 	const registerProvider = FIRST_CLASS_OAUTH_PROVIDER_REGISTRARS[provider];
@@ -328,6 +330,7 @@ export class ProviderRegistry {
 		private readonly authWriter: AuthWriter = new AuthWriter(),
 		private readonly modelsPath: string = getDefaultModelsPath(),
 		private readonly legacyProviders: readonly string[] = LEGACY_SUPPORTED_PROVIDERS,
+		private readonly modelsStorePath: string = join(dirname(modelsPath), "models-store.json"),
 	) {}
 
 	async discoverProviderIds(): Promise<SupportedProviderId[]> {
@@ -508,13 +511,19 @@ export class ProviderRegistry {
 				return null;
 			}
 
-			const apis = [...new Set(builtInModels.map((m) => m.api))];
+			const modelsById = new Map(builtInModels.map((model) => [model.id, mapBuiltInModel(model)]));
+			const refreshedModels = await this.readRefreshedModels(provider, firstModel.api);
+			for (const model of refreshedModels) {
+				modelsById.set(model.id, model);
+			}
+			const models = [...modelsById.values()];
+			const apis = [...new Set(models.map((model) => model.api ?? firstModel.api))];
 			return {
 				provider,
 				api: firstModel.api,
 				apis,
 				baseUrl: firstModel.baseUrl,
-				models: builtInModels.map(mapBuiltInModel),
+				models,
 			};
 		}
 
@@ -536,6 +545,40 @@ export class ProviderRegistry {
 			baseUrl: fromFile.baseUrl,
 			models: [...fromFile.models],
 		};
+	}
+
+	private async readRefreshedModels(
+		provider: SupportedProviderId,
+		providerApi: Api,
+	): Promise<ProviderModelDefinition[]> {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(await readFile(this.modelsStorePath, "utf-8"));
+		} catch {
+			return [];
+		}
+		if (!isRecord(parsed) || !isRecord(parsed[provider]) || !Array.isArray(parsed[provider].models)) {
+			return [];
+		}
+
+		const generatedAt = getBuiltinModelDataGeneratedAt();
+		const lastModified = parsed[provider].lastModified;
+		if (
+			generatedAt !== undefined &&
+			(typeof lastModified !== "number" || lastModified <= generatedAt)
+		) {
+			return [];
+		}
+
+		return parsed[provider].models
+			.filter(
+				(model) =>
+					isRecord(model) &&
+					model.provider === provider &&
+					(model.type === undefined || model.type === "chat"),
+			)
+			.map((model) => normalizeModelRecord(model, providerApi))
+			.filter((model): model is ProviderModelDefinition => model !== null);
 	}
 
 	private async readModelsFile(): Promise<ModelsFileData> {
